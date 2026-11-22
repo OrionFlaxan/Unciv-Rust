@@ -46,9 +46,10 @@ jobs:
       - name: Ensure Android NDK is installed
         run: |
           SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          SDKMANAGER="$(command -v sdkmanager || echo "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager")"
           if [ ! -d "$SDK_DIR/ndk/27.3.13750724" ]; then
-            yes | sdkmanager --licenses >/dev/null 2>&1 || true
-            sdkmanager --install "ndk;27.3.13750724"
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "ndk;27.3.13750724"
           fi
           echo "ANDROID_NDK_HOME=$SDK_DIR/ndk/27.3.13750724" >> "$GITHUB_ENV"
 
@@ -108,9 +109,8 @@ jobs:
             PRERELEASE_FLAG=""
           fi
 
-          python3 - <<'PYEOF'
-          with open("release-notes.md", "w") as f:
-              f.write("""## Unciv-Rust Release — Rust Native Simulation Engine
+          cat <<'NOTESEOF' > release-notes.md
+          ## Unciv-Rust Release — Rust Native Simulation Engine
 
           High-performance Rust-accelerated fork of [Unciv](https://github.com/yairm210/Unciv) designed for smooth **300+ turn Large and Huge maps** on Android and Desktop — with **zero UI changes** and **100% vanilla rules, mods, and save-file compatibility**.
 
@@ -127,8 +127,7 @@ jobs:
           ### Android Installation Notes
           1. Download **`Unciv-Rust-Android.apk`** on your Android device and tap to install (enable **Install unknown apps** if prompted).
           2. Because this APK uses Unciv's default package ID (`com.unciv.app`) with the debug signing key, back up your saves and uninstall any Google Play / F-Droid copy of Unciv before installing.
-          """.replace("\n          ", "\n"))
-          PYEOF
+          NOTESEOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
