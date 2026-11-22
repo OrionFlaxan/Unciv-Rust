@@ -675,8 +675,18 @@ class City : IsPartOfGameInfoSerialization, INamed {
     fun forEachLocalMatchingUnique(uniqueType: UniqueType, gameContext: GameContext = state, op: (unique: Unique)->Unit) {
         cityConstructions.builtBuildingUniqueMap.forEachMatchingUnique(uniqueType, gameContext, isLocalUniqueFilter, op)
         religion.forEachMatchingUnique(uniqueType, gameContext, op)
-        for (resource in getLocalResources())
-            resource.forEachMatchingUnique(uniqueType, gameContext, isLocalUniqueFilter, op)
+        if (!getRuleset().hasResourceLocalUnique(uniqueType)) return
+        var seenFirst: TileResource? = null
+        @LocalState val seenMore = ArrayList<TileResource>(2)
+        for (pos in tiles) {
+            val tile = tileMap[pos]
+            val res = tile.tileResource ?: continue
+            if (res === seenFirst || res in seenMore) continue
+            if (!res.uniqueMap.hasTypedUnique(uniqueType)) continue
+            if (!tile.providesResources(civ)) continue
+            if (seenFirst == null) seenFirst = res else seenMore.add(res)
+            res.forEachMatchingUnique(uniqueType, gameContext, isLocalUniqueFilter, op)
+        }
     }
 
     // Local effects depend on owned, extractable deposits, even when all copies are exported.

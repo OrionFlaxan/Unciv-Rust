@@ -72,7 +72,19 @@ class UnitMovement(val unit: MapUnit) {
         movementCostCache: HashMap<Int, Float> = HashMap(),
         includeOtherEscortUnit: Boolean = true
     ): PathsToTilesWithinTurn = timeThis("getMovementToTilesAtPosition") {
-        if (UncivGame.Current.settings.useAStarPathfinding) {
+        val useAStar = UncivGame.Current.settings.useAStarPathfinding
+        // Fast native Rust single-turn pathing (handles both Classic & A* semantics)
+        if (tilesToIgnoreBitset == null && canPassThroughCache.isEmpty() && movementCostCache.isEmpty()) {
+            val mirror = unit.currentTile.tileMap.getOrCreateNativeWorld()
+            if (mirror != null && mirror.canUseNativePathing(unit, includeOtherEscortUnit)) {
+                val effectiveMove = if (useAStar && com.unciv.logic.map.pathingmap.FixedPointMovement.fpmFromMovement(unitMovement).bits <= 0) 0f else unitMovement
+                return mirror.computeDistanceWithinTurn(
+                    unit, position, effectiveMove, considerZoneOfControl,
+                    includeUnpassableBoundary = true
+                )
+            }
+        }
+        if (useAStar) {
             if (!considerZoneOfControl) require(includeOtherEscortUnit)
             val pathingMap = if (!considerZoneOfControl) aStarPathingWithoutZoneControl
                 else if (includeOtherEscortUnit || !unit.isEscorting()) aStarPathing
@@ -151,9 +163,29 @@ class UnitMovement(val unit: MapUnit) {
      * Does not consider if the [destination] tile can actually be entered, use [canMoveTo] for that.
      * Returns an empty list if there's no way to get to the destination.
      */
-    @Readonly
+    @Readonly @Suppress("purity")
     fun getShortestPath(destination: Tile, avoidDamagingTerrain: Boolean = false): List<Tile> = timeThis<List<Tile>>("getShortestPath")  {
         if (unit.cache.cannotMove) return listOf()
+        val currentTile = unit.getTile()
+        if (currentTile.position == destination.position) {
+            // edge case that's needed, so that workers will know that they can reach their own tile. *sigh*
+            pathfindingCache.setShortestPathCache(destination, listOf(currentTile))
+            return listOf(currentTile)
+        }
+        if (pathfindingCache.isUnreachable(destination)) return listOf()
+        val cachedPath = pathfindingCache.getShortestPathCache(destination)
+        if (cachedPath.isNotEmpty())
+            return cachedPath
+
+        // Native Rust multi-turn A* (replaces nested wave-BFS and per-unit PathingMap allocation)
+        val mirror = currentTile.tileMap.getOrCreateNativeWorld()
+        if (mirror != null && mirror.canUseNativePathing(unit, true)) {
+            val nativePath = mirror.findShortestPath(unit, destination, avoidDamagingTerrain)
+            if (nativePath.isEmpty()) pathfindingCache.markUnreachable(destination)
+            else pathfindingCache.setShortestPathCache(destination, nativePath)
+            return nativePath
+        }
+
         if (UncivGame.Current.settings.useAStarPathfinding)
             return aStarPathing.getShortestPath(destination) ?: listOf()
 
@@ -166,18 +198,9 @@ class UnitMovement(val unit: MapUnit) {
         if (destination.neighbors.none { isUnknownTileWeShouldAssumeToBePassable(it) || canPassThrough(it) }) {
             // edge case where this all of the tiles around the destination are
             // explored and known the unit can't pass through any of thoes tiles so we know a priori that no path exists
+            pathfindingCache.markUnreachable(destination)
             pathfindingCache.setShortestPathCache(destination, listOf())
             return listOf()
-        }
-        val cachedPath = pathfindingCache.getShortestPathCache(destination)
-        if (cachedPath.isNotEmpty())
-            return cachedPath
-
-        val currentTile = unit.getTile()
-        if (currentTile.position == destination.position) {
-            // edge case that's needed, so that workers will know that they can reach their own tile. *sigh*
-            pathfindingCache.setShortestPathCache(destination, listOf(currentTile))
-            return listOf(currentTile)
         }
 
         var tilesToCheck = listOf(currentTile)
@@ -949,18 +972,33 @@ class UnitMovement(val unit: MapUnit) {
         movementCostCache: HashMap<Int, Float>? = null,
         includeOtherEscortUnit: Boolean = true
     ): PathsToTilesWithinTurn {
-        if (UncivGame.Current.settings.useAStarPathfinding) {
-            if (!considerZoneOfControl) require(includeOtherEscortUnit)
-            val pathingMap = if (!considerZoneOfControl) aStarPathingWithoutZoneControl
-                else if (includeOtherEscortUnit || !unit.isEscorting()) aStarPathing
-                else aStarPathingWithoutEscort
-            return pathingMap.getMovementToTilesAtPosition()
-        }
         // Only the default call is cacheable - callers passing their own caches expect them to be filled
         val isDefaultCall = considerZoneOfControl && includeOtherEscortUnit
             && passThroughCacheNew == null && movementCostCache == null
         if (isDefaultCall) {
             pathfindingCache.getDistanceToTilesCache()?.let { return it }
+        }
+
+        val useAStar = UncivGame.Current.settings.useAStarPathfinding
+        if (passThroughCacheNew == null && movementCostCache == null) {
+            val mirror = unit.currentTile.tileMap.getOrCreateNativeWorld()
+            if (mirror != null && mirror.canUseNativePathing(unit, includeOtherEscortUnit)) {
+                val effectiveMove = if (useAStar && com.unciv.logic.map.pathingmap.FixedPointMovement.fpmFromMovement(unit.currentMovement).bits <= 0) 0f else unit.currentMovement
+                val distanceToTiles = mirror.computeDistanceWithinTurn(
+                    unit, unit.currentTile.position, effectiveMove,
+                    considerZoneOfControl, includeUnpassableBoundary = true
+                )
+                if (isDefaultCall) pathfindingCache.setDistanceToTilesCache(distanceToTiles)
+                return distanceToTiles
+            }
+        }
+
+        if (useAStar) {
+            if (!considerZoneOfControl) require(includeOtherEscortUnit)
+            val pathingMap = if (!considerZoneOfControl) aStarPathingWithoutZoneControl
+                else if (includeOtherEscortUnit || !unit.isEscorting()) aStarPathing
+                else aStarPathingWithoutEscort
+            return pathingMap.getMovementToTilesAtPosition()
         }
 
         val distanceToTiles = getMovementToTilesAtPosition(
@@ -975,6 +1013,38 @@ class UnitMovement(val unit: MapUnit) {
 
         if (isDefaultCall) pathfindingCache.setDistanceToTilesCache(distanceToTiles)
         return distanceToTiles
+    }
+
+    /**
+     * Single-expansion batch reachability over priority-ordered [candidates].
+     * Returns `(firstReachableIndex, shortestPath)` or `(-1, emptyList())` if none is reachable.
+     */
+    @Readonly @Suppress("purity")
+    fun batchFirstReachable(candidates: List<Tile>): Pair<Int, List<Tile>> {
+        if (candidates.isEmpty() || unit.cache.cannotMove) return -1 to emptyList()
+        if (unit.baseUnit.isAirUnit() || unit.isPreparingParadrop()) {
+            for (i in candidates.indices) {
+                if (canReach(candidates[i])) return i to listOf(candidates[i])
+            }
+            return -1 to emptyList()
+        }
+        val mirror = unit.getTile().tileMap.getOrCreateNativeWorld()
+        if (mirror != null && mirror.canUseNativePathing(unit, true)) {
+            val res = mirror.batchFirstReachable(unit, candidates)
+            if (res.first >= 0) {
+                pathfindingCache.setShortestPathCache(candidates[res.first], res.second)
+                // Any higher-priority candidates before res.first were proven unreachable
+                for (i in 0 until res.first) pathfindingCache.markUnreachable(candidates[i])
+            } else {
+                for (c in candidates) pathfindingCache.markUnreachable(c)
+            }
+            return res
+        }
+        for (i in candidates.indices) {
+            val path = getShortestPath(candidates[i])
+            if (path.isNotEmpty()) return i to path
+        }
+        return -1 to emptyList()
     }
 
     /**
@@ -1020,21 +1090,36 @@ class UnitMovement(val unit: MapUnit) {
  * the result since otherwise this is a redundant calculation that will find the same path.
  */
 class PathfindingCache(private val unit: MapUnit) {
-    private var shortestPathCache = listOf<Tile>()
-    private var destination: Tile? = null
+    private var shortestPathMap: HashMap<Tile, List<Tile>>? = null
     private var movement = -1f
     private var currentTile: Tile? = null
     private var distanceToTilesCache: PathsToTilesWithinTurn? = null
+    private var unreachableIndices: BitSet? = null
 
     /** Check if the caches are valid (only checking if the unit has moved or consumed movement points;
      * the isPlayerCivilization check is performed in the functions because we want isValid() == false
      * to have a specific behavior) */
     @Readonly private fun isValid(): Boolean = (movement == unit.currentMovement) && (unit.getTile() == currentTile)
 
+    @Readonly
+    fun isUnreachable(destination: Tile): Boolean {
+        if (unit.civ.isHuman()) return false
+        val bits = unreachableIndices ?: return false
+        return isValid() && bits.get(destination.zeroBasedIndex)
+    }
+
+    fun markUnreachable(destination: Tile) {
+        if (unit.civ.isHuman()) return
+        if (isValid()) {
+            val bits = unreachableIndices ?: BitSet().also { unreachableIndices = it }
+            bits.set(destination.zeroBasedIndex)
+        }
+    }
+
     fun getShortestPathCache(destination: Tile): List<Tile> {
         if (unit.civ.isHuman()) return listOf()
-        if (isValid() && this.destination == destination) {
-            return shortestPathCache
+        if (isValid()) {
+            return shortestPathMap?.get(destination) ?: listOf()
         }
         return listOf()
     }
@@ -1042,8 +1127,16 @@ class PathfindingCache(private val unit: MapUnit) {
     fun setShortestPathCache(destination: Tile, newShortestPath: List<Tile>) {
         if (unit.civ.isHuman()) return
         if (isValid()) {
-            shortestPathCache = newShortestPath
-            this.destination = destination
+            val map = shortestPathMap ?: HashMap<Tile, List<Tile>>(4).also { shortestPathMap = it }
+            map[destination] = newShortestPath
+            if (newShortestPath.isNotEmpty()) {
+                unreachableIndices?.clear(destination.zeroBasedIndex)
+                val first = newShortestPath[0]
+                if (first != destination && !map.containsKey(first)) {
+                    map[first] = listOf(first)
+                    unreachableIndices?.clear(first.zeroBasedIndex)
+                }
+            }
         }
     }
 
@@ -1060,8 +1153,8 @@ class PathfindingCache(private val unit: MapUnit) {
         distanceToTilesCache = null
         movement = unit.currentMovement
         currentTile = unit.getTile()
-        destination = null
-        shortestPathCache = listOf()
+        shortestPathMap?.clear()
+        unreachableIndices?.clear()
     }
 }
 

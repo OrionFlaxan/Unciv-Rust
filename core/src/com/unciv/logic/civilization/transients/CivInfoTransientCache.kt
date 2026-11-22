@@ -104,6 +104,105 @@ class CivInfoTransientCache(val civInfo: Civilization) {
         updateCivResources()
     }
 
+    @Transient
+    private var visionSynced: Boolean = false
+
+    @Transient
+    private var mutableViewableTiles: HashSet<Tile>? = null
+
+    fun invalidateVisionSync() {
+        visionSynced = false
+        civInfo.gameInfo.tileMap.nativeWorld?.markVisionDirty(civInfo)
+    }
+
+    /**
+     * O(ring) incremental civ vision update when a single unit moves.
+     * Falls back to full [updateViewableTiles] if vision isn't synced or for human/spectator UI safety.
+     */
+    fun onUnitVisionChanged(
+        unit: com.unciv.logic.map.mapunit.MapUnit,
+        oldTiles: Set<Tile>,
+        newTiles: Set<Tile>,
+        needsFullSideEffects: Boolean,
+        explorerPosition: HexCoord? = null
+    ) {
+        if (civInfo.hasSpectatorVision() || DebugUtils.VISIBLE_MAP || civInfo.isDefeated()) {
+            if (needsFullSideEffects) updateViewableTiles(explorerPosition)
+            return
+        }
+        val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+        val mSet = mutableViewableTiles
+        if (mirror == null || !visionSynced || mSet == null || !civInfo.isAI()) {
+            // Keep Rust refcounts consistent when human moves inside/outside borders
+            if (mirror != null && visionSynced) {
+                mirror.applyUnitVisionDelta(civInfo, oldTiles, newTiles)
+            }
+            if (needsFullSideEffects) updateViewableTiles(explorerPosition)
+            return
+        }
+
+        val delta = mirror.applyUnitVisionDelta(civInfo, oldTiles, newTiles)
+        if (delta == null) {
+            visionSynced = false
+            if (needsFullSideEffects) updateViewableTiles(explorerPosition)
+            return
+        }
+
+        // Update AI civ's HashSet in O(|delta|) instead of rebuilding thousands of tiles
+        for (t in delta.removedVisible) mSet.remove(t)
+        for (t in delta.addedVisible) mSet.add(t)
+
+        if (unit.hasUnique(UniqueType.CanSeeInvisibleUnits)) {
+            updateViewableInvisibleTiles()
+        }
+
+        if (delta.newlyExplored.isNotEmpty()) {
+            for (tile in delta.newlyExplored) {
+                tile.setExplored(civInfo, true, explorerPosition)
+            }
+        }
+
+        if (!civInfo.isBarbarian && delta.addedVisible.isNotEmpty()) {
+            checkCivEncountersAndWonders(delta.addedVisible)
+        }
+    }
+
+    private fun checkCivEncountersAndWonders(tilesToCheck: Iterable<Tile>) {
+        var viewedCivs: HashMap<Civilization, Tile>? = null
+        for (tile in tilesToCheck) {
+            val tileOwner = tile.getOwner()
+            if (tileOwner != null && tileOwner != civInfo && !tileOwner.isBarbarian && !civInfo.diplomacy.containsKey(tileOwner.civID)) {
+                val map = viewedCivs ?: HashMap<Civilization, Tile>(4).also { viewedCivs = it }
+                map[tileOwner] = tile
+            }
+            val unitOwner = tile.getFirstUnit()?.civ
+            if (unitOwner != null && unitOwner != civInfo && !unitOwner.isBarbarian && !civInfo.diplomacy.containsKey(unitOwner.civID)) {
+                val map = viewedCivs ?: HashMap<Civilization, Tile>(4).also { viewedCivs = it }
+                map[unitOwner] = tile
+            }
+        }
+        val metMap = viewedCivs
+        if (metMap != null) {
+            for (entry in metMap) {
+                val metCiv = entry.key
+                if (metCiv == civInfo || metCiv.isBarbarian || civInfo.diplomacy.containsKey(metCiv.civID)) continue
+                civInfo.diplomacyFunctions.makeCivilizationsMeet(metCiv)
+                if (!civInfo.isSpectator)
+                    civInfo.addNotification("We have encountered [${metCiv.civName}]!",
+                        entry.value.position,
+                        NotificationCategory.Diplomacy, metCiv.civName,
+                        NotificationIcon.Diplomacy
+                    )
+                metCiv.addNotification("We have encountered [${civInfo.civName}]!",
+                    entry.value.position,
+                    NotificationCategory.Diplomacy, civInfo.civName,
+                    NotificationIcon.Diplomacy
+                )
+            }
+        }
+        discoverNaturalWonders(tilesToCheck)
+    }
+
     // This is a big performance
     fun updateViewableTiles(explorerPosition: HexCoord? = null) {
         setNewViewableTiles()
@@ -117,38 +216,14 @@ class CivInfoTransientCache(val civInfo: Civilization) {
         // Well, because it gets REALLY LARGE so it's a lot of memory space,
         // and we never actually iterate on the explored tiles (only check contains()),
         // so there's no fear of concurrency problems.
-        civInfo.viewableTiles.asSequence().forEach { tile ->
-            tile.setExplored(civInfo, true, explorerPosition)
-        }
-
-
-        val viewedCivs = HashMap<Civilization, Tile>()
         for (tile in civInfo.viewableTiles) {
-            val tileOwner = tile.getOwner()
-            if (tileOwner != null) viewedCivs[tileOwner] = tile
-            val unitOwner = tile.getFirstUnit()?.civ
-            if (unitOwner != null) viewedCivs[unitOwner] = tile
+            if (!tile.isExplored(civInfo) || civInfo.playerType == PlayerType.Human) {
+                tile.setExplored(civInfo, true, explorerPosition)
+            }
         }
 
         if (!civInfo.isBarbarian) {
-            for (entry in viewedCivs) {
-                val metCiv = entry.key
-                if (metCiv == civInfo || metCiv.isBarbarian || civInfo.diplomacy.containsKey(metCiv.civID)) continue
-                civInfo.diplomacyFunctions.makeCivilizationsMeet(metCiv)
-                if(!civInfo.isSpectator)
-                    civInfo.addNotification("We have encountered [${metCiv.civName}]!",
-                        entry.value.position,
-                        NotificationCategory.Diplomacy, metCiv.civName,
-                        NotificationIcon.Diplomacy
-                    )
-                metCiv.addNotification("We have encountered [${civInfo.civName}]!",
-                    entry.value.position,
-                    NotificationCategory.Diplomacy, civInfo.civName,
-                    NotificationIcon.Diplomacy
-                )
-            }
-
-            discoverNaturalWonders()
+            checkCivEncountersAndWonders(civInfo.viewableTiles)
         }
     }
 
@@ -188,6 +263,8 @@ class CivInfoTransientCache(val civInfo: Civilization) {
         // while spectating (or defeated in singleplayer, which grants the same rights) all map is visible
         if (civInfo.hasSpectatorVision() || DebugUtils.VISIBLE_MAP) {
             civInfo.viewableTiles = civInfo.gameInfo.tileMap.values.toSet()
+            mutableViewableTiles = null
+            visionSynced = false
             return
         }
 
@@ -196,21 +273,48 @@ class CivInfoTransientCache(val civInfo: Civilization) {
             // In that case ourTilesAndNeighboringTiles and getCivUnits will be empty, but the for
             // loop getKnownCivs/getAllyCiv would add tiles.
             civInfo.viewableTiles = emptySet()
+            mutableViewableTiles = null
+            visionSynced = false
             return
         }
 
-        val newViewableTiles = HashSet<Tile>(ourTilesAndNeighboringTiles)
-        newViewableTiles.addAll(civInfo.units.getCivUnits().flatMap { unit -> unit.viewableTiles.asSequence().filter { it.getOwner() != civInfo } })
-
+        val staticTiles = HashSet<Tile>(ourTilesAndNeighboringTiles)
         for (otherCiv in civInfo.getKnownCivs()) {
             if (otherCiv.allyCiv == civInfo || otherCiv == civInfo.allyCiv) {
-                newViewableTiles.addAll(otherCiv.cities.asSequence().flatMap { it.getTiles() })
+                for (city in otherCiv.cities) {
+                    staticTiles.addAll(city.getTiles())
+                }
             }
         }
+        staticTiles.addAll(civInfo.espionageManager.getTilesVisibleViaSpies())
 
-        newViewableTiles.addAll(civInfo.espionageManager.getTilesVisibleViaSpies())
+        val newViewableTiles = HashSet<Tile>(staticTiles)
+        val civUnits = civInfo.units.getCivUnits().toList()
+        var totalUnitTileEntries = 0
+        for (u in civUnits) {
+            val uTiles = u.viewableTiles
+            totalUnitTileEntries += uTiles.size
+            newViewableTiles.addAll(uTiles)
+        }
 
+        mutableViewableTiles = newViewableTiles
         civInfo.viewableTiles = newViewableTiles // to avoid concurrent modification problems
+
+        // Sync reference-counted vision in NativeWorldMirror so subsequent unit moves are O(ring)
+        val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+        if (mirror != null) {
+            val flatUnitTiles = IntArray(totalUnitTileEntries)
+            var idx = 0
+            for (u in civUnits) {
+                for (t in u.viewableTiles) {
+                    flatUnitTiles[idx++] = t.zeroBasedIndex
+                }
+            }
+            mirror.rebuildCivVision(civInfo, staticTiles, flatUnitTiles)
+            visionSynced = true
+        } else {
+            visionSynced = false
+        }
     }
 
     private fun updateLastSeenImprovements() {

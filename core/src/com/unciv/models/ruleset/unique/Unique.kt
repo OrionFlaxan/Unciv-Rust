@@ -55,6 +55,10 @@ class Unique(val text: String, val sourceObjectType: UniqueTarget? = null, val s
 
     @Readonly fun getModifiers(type: UniqueType) = modifiersMap[type] ?: emptyList()
     @Readonly fun hasModifier(type: UniqueType) = modifiersMap.containsKey(type)
+    val hasMultiplierModifiers: Boolean =
+        modifiersMap.containsKey(UniqueType.ForEveryCountable)
+            || modifiersMap.containsKey(UniqueType.ForEveryAmountCountable)
+            || modifiersMap.containsKey(UniqueType.ForEveryAdjacentTile)
     @Readonly fun isModifiedByGameSpeed() = hasModifier(UniqueType.ModifiedByGameSpeed)
     @Readonly fun isModifiedByGameProgress() = hasModifier(UniqueType.ModifiedByGameProgress)
     @Readonly
@@ -99,7 +103,7 @@ class Unique(val text: String, val sourceObjectType: UniqueTarget? = null, val s
 
     @Readonly
     fun getUniqueMultiplier(gameContext: GameContext): Int {
-        if (gameContext == GameContext.IgnoreMultiplicationForCaching)
+        if (!hasMultiplierModifiers || gameContext == GameContext.IgnoreMultiplicationForCaching)
             return 1
         
         var amount = 1
@@ -140,6 +144,10 @@ class Unique(val text: String, val sourceObjectType: UniqueTarget? = null, val s
     
     @Readonly
     fun forEachMultiplied(gameContext: GameContext, op:(Unique)->Unit) {
+        if (!hasMultiplierModifiers) {
+            op(this)
+            return
+        }
         val multiplier = getUniqueMultiplier(gameContext)
         for (j in 0..<multiplier)
             op(this)

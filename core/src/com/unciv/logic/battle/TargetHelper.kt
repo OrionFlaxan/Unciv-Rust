@@ -26,6 +26,80 @@ object TargetHelper {
             sequenceOf(Pair(unit.currentTile, unit.currentMovement))
         else getTilesToAttackFromWhenUnitMoves(unitDistanceToTiles, unitMustBeSetUp, unit)
 
+        // Fast bounding-disk pre-filter + native Rust single-pass pair discovery for non-nuke / non-air-sweep units.
+        // Eliminates redundant LOS calls (37x+ for long-range units on roads) and skips LOS entirely when no enemy is nearby.
+        if (!unit.isNuclearWeapon() && !unit.isPreparingAirSweep()) {
+            val fromList = ArrayList<Pair<Tile, Float>>()
+            val isMelee = unit.baseUnit.isMelee()
+            val isEscortingMelee = isMelee && unit.isEscorting()
+            val escortUnit = if (isEscortingMelee) unit.getOtherEscortUnit() else null
+            val unitTile = unit.currentTile
+            var maxReachAerial = 0
+            for (pair in tilesToAttackFrom) {
+                if (escortUnit != null) {
+                    if (!escortUnit.movement.canReachInCurrentTurn(pair.first)
+                        || escortUnit.currentMovement - escortUnit.movement.getDistanceToTiles()[pair.first]!!.totalMovement <= 0f)
+                        continue
+                }
+                fromList.add(pair)
+                val d = unitTile.aerialDistanceTo(pair.first)
+                if (d > maxReachAerial) maxReachAerial = d
+            }
+            if (fromList.isEmpty()) return attackableTiles
+
+            val effectiveRange = if (isMelee) 1 else rangeOfAttack
+            val searchRadius = maxReachAerial + effectiveRange
+            val candidateEnemies = ArrayList<Tile>(8)
+            val civ = unit.civ
+            val visibleSet = tilesToCheck?.toHashSet()
+            unitTile.tileMap.forEachTileInDistance(unitTile.position, searchRadius) { t ->
+                // Cheap pointer pre-check before full tileContainsAttackableEnemy
+                if (!t.isCityCenter() && t.militaryUnit == null && t.civilianUnit == null) return@forEachTileInDistance
+                val inView = if (visibleSet != null) t in visibleSet else t in civ.viewableTiles
+                if (inView && tileContainsAttackableEnemy(unit, t, tilesToCheck)) {
+                    candidateEnemies.add(t)
+                }
+            }
+            if (candidateEnemies.isEmpty()) return attackableTiles
+
+            val indirectFire = unit.baseUnit.isAirUnit() || unit.hasUnique(UniqueType.IndirectFire, checkCivInfoUniques = true)
+            val mirror = unitTile.tileMap.getOrCreateNativeWorld()
+            if (mirror != null) {
+                val fromIdx = IntArray(fromList.size) { fromList[it].first.zeroBasedIndex }
+                val fromMoveBits = IntArray(fromList.size) { java.lang.Float.floatToRawIntBits(fromList[it].second) }
+                val enemyIdx = IntArray(candidateEnemies.size) { candidateEnemies[it].zeroBasedIndex }
+                val pairs = mirror.findAttackablePairs(
+                    civ, fromIdx, fromMoveBits, effectiveRange, isMelee, indirectFire, enemyIdx
+                )
+                val tileList = unitTile.tileMap.tileList
+                var i = 0
+                val len = pairs.size
+                while (i + 2 < len) {
+                    val fromT = tileList[pairs[i]]
+                    val targetT = tileList[pairs[i + 1]]
+                    val moveLeft = java.lang.Float.intBitsToFloat(pairs[i + 2])
+                    attackableTiles.add(AttackableTile(fromT, targetT, moveLeft, Battle.getMapCombatantOfTile(targetT)))
+                    i += 3
+                }
+                return attackableTiles
+            }
+
+            // Pure-Kotlin fallback using the already-filtered candidateEnemies list
+            val enemySet = candidateEnemies.toHashSet()
+            for ((reachableTile, movementLeft) in fromList) {
+                val tilesInAttackRange =
+                    if (isMelee) reachableTile.neighbors
+                    else if (indirectFire) reachableTile.getTilesInDistance(rangeOfAttack)
+                    else reachableTile.tileMap.getViewableTiles(reachableTile.position, rangeOfAttack, true).asSequence()
+                for (tile in tilesInAttackRange) {
+                    if (tile != reachableTile && tile in enemySet) {
+                        attackableTiles += AttackableTile(reachableTile, tile, movementLeft, Battle.getMapCombatantOfTile(tile))
+                    }
+                }
+            }
+            return attackableTiles
+        }
+
         val tilesWithEnemies: HashSet<Tile> = HashSet()
         val tilesWithoutEnemies: HashSet<Tile> = HashSet()
         for ((reachableTile, movementLeft) in tilesToAttackFrom) {  // tiles we'll still have energy after we reach there

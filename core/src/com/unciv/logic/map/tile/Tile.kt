@@ -1,4 +1,4 @@
-﻿package com.unciv.logic.map.tile
+package com.unciv.logic.map.tile
 
 import com.unciv.Constants
 import com.unciv.GUI
@@ -79,16 +79,49 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
     }
     internal val improvementQueue = ArrayList<ImprovementQueueEntry>(1)
 
+    @Readonly
+    private fun isLiveMapTile(): Boolean {
+        if (!isTilemapInitialized()) return false
+        val idx = zeroBasedIndex
+        val list = tileMap.tileList
+        return idx >= 0 && idx < list.size && list[idx] === this
+    }
+
     var roadStatus = RoadStatus.None
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isLiveMapTile()) tileMap.nativeWorld?.onTileDynamicChanged(this)
+        }
 
     var roadIsPillaged = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isLiveMapTile()) tileMap.nativeWorld?.onTileDynamicChanged(this)
+        }
     private var roadOwner: String = "" // either who last built the road or last owner of tile
 
     @Transient private var roadOwnerObject: Civilization? = null
 
     var hasBottomRightRiver = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isLiveMapTile()) tileMap.nativeWorld?.topologyDirty = true
+        }
     var hasBottomRiver = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isLiveMapTile()) tileMap.nativeWorld?.topologyDirty = true
+        }
     var hasBottomLeftRiver = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isLiveMapTile()) tileMap.nativeWorld?.topologyDirty = true
+        }
 
     var history: TileHistory = TileHistory()
 
@@ -317,8 +350,18 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
     fun isExplored(player: Civilization): Boolean {
         if (DebugUtils.VISIBLE_MAP || player.isSpectator)
             return true
+        val bits = player.exploredTileBits
+        if (isTilemapInitialized() && player.exploredTileBitsMap === tileMap) {
+            val idx = zeroBasedIndex
+            val w = idx ushr 6
+            if (w in 0 until bits.size) {
+                return ((bits[w] ushr (idx and 63)) and 1L) != 0L
+            }
+        }
         return exploredBy.contains(player.civID)
     }
+
+    @Readonly internal fun getExploredByIds(): Set<String> = exploredBy
 
     @Readonly fun isCityCenter(): Boolean = isCityCenterInternal
     @Readonly fun isNaturalWonder(): Boolean = naturalWonder != null
@@ -858,6 +901,7 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
             // Let's assume it's a small deposit
             setTileResource(tileResource!!, majorDeposit = false)
         }
+        if (isLiveMapTile()) tileMap.nativeWorld?.onTileTerrainChanged(this)
     }
 
     fun setUnitTransients(unitCivTransients: Boolean) {
@@ -883,6 +927,9 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
     }
 
     fun setOwningCity(city: City?) {
+        val prevOwnerCiv = owningCity?.civ
+        val prevCityCenter = isCityCenterInternal
+        val prevJustConquered = owningCity?.hasJustBeenConquered == true
         if (roadOwner != "" && roadOwnerObject == null)
             roadOwnerObject = tileMap.gameInfo.getCivilization(roadOwner)
         if (city != null) {
@@ -900,6 +947,13 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
         owningCity = city
         stateThisTile = GameContext(tile = this, city = city, gameInfo = tileMap.gameInfo)
         isCityCenterInternal = getCity()?.location?.toHexCoord() == position
+        val newOwnerCiv = city?.civ
+        val newJustConquered = city?.hasJustBeenConquered == true
+        if ((prevOwnerCiv !== newOwnerCiv || prevCityCenter != isCityCenterInternal || prevJustConquered != newJustConquered)
+            && isLiveMapTile()
+        ) {
+            tileMap.nativeWorld?.onTileDynamicChanged(this)
+        }
     }
 
     /**
@@ -1028,6 +1082,7 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
             civilianUnit == mapUnit -> civilianUnit = null
             militaryUnit == mapUnit -> militaryUnit = null
         }
+        if (isLiveMapTile()) tileMap.nativeWorld?.onTileUnitsChanged(this)
     }
 
     fun setImprovementBasic(tileImprovement: TileImprovement?) {
@@ -1194,17 +1249,29 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
     }
 
     fun setExplored(player: Civilization, isExplored: Boolean, explorerPosition: HexCoord? = null) {
+        val bits = player.exploredTileBits
+        val hasBits = isTilemapInitialized() && player.exploredTileBitsMap === tileMap && (zeroBasedIndex ushr 6) in 0 until bits.size
         if (isExplored) {
+            if (hasBits && player.isExploredBitSet(zeroBasedIndex)) {
+                if (player.playerType == PlayerType.Human)
+                    player.exploredRegion.expandToInclude(position, explorerPosition)
+                return
+            }
+            if (hasBits) player.setExploredBit(zeroBasedIndex, true)
             // Disable the undo button if a new tile has been explored
             if (!exploredBy.contains(player.civID)) {
                 GUI.clearUndoCheckpoints()
                 exploredBy = exploredBy.withItem(player.civID)
             }
+            if (isTilemapInitialized()) tileMap.nativeWorld?.onTileExploredChanged(player, this, true)
 
             if (player.playerType == PlayerType.Human)
                 player.exploredRegion.expandToInclude(position, explorerPosition)
         } else {
+            if (hasBits && !player.isExploredBitSet(zeroBasedIndex)) return
+            if (hasBits) player.setExploredBit(zeroBasedIndex, false)
             exploredBy = exploredBy.withoutItem(player.civID)
+            if (isTilemapInitialized()) tileMap.nativeWorld?.onTileExploredChanged(player, this, false)
         }
     }
 
@@ -1250,6 +1317,7 @@ class Tile : IsPartOfGameInfoSerialization, TileInterface<Tile> {
             tile.resetAdjacentToRiverTransient(newValue)
         if (convertTerrains)
             MapGenerator.Helpers.convertTerrains(ruleset, affectedTiles)
+        if (isTilemapInitialized()) tileMap.nativeWorld?.topologyDirty = true
         return true
     }
 

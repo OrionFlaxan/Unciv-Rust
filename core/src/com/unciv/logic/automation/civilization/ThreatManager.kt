@@ -53,6 +53,57 @@ object ThreatManager {
 
 
         if (tileData != null && tileData.tilesWithEnemies.isNotEmpty()) throw IllegalStateException("There must be no elements in tile.data.tilesWithEnemies at this point")
+
+        // Native Rust O(1) multi-source threat field fast path (preserves exact AutomationCache semantics)
+        val nativeDist = civ.getDistanceToClosestEnemyNative(tile, maxDist, true)
+        if (nativeDist != null) {
+            if (nativeDist > maxDist) {
+                cache.distanceToClosestEnemyTiles[tile] = AutomationCache.ClosestEnemyTileData(maxDist, mutableListOf())
+                return notFoundDistance
+            }
+            if (minDistanceToSearch <= 1) {
+                val enemyTiles = civ.getEnemyTilesInDistanceNative(tile, nativeDist)
+                val list = mutableListOf<Pair<TileView, Int>>()
+                if (enemyTiles != null) {
+                    for (et in enemyTiles) {
+                        if (et.aerialDistanceTo(tile) == nativeDist && doesTileHaveMilitaryEnemy(civ, et)) {
+                            list.add(Pair(et, nativeDist))
+                        }
+                    }
+                }
+                if (list.isNotEmpty()) {
+                    cache.distanceToClosestEnemyTiles[tile] = AutomationCache.ClosestEnemyTileData(nativeDist, list)
+                    return nativeDist
+                }
+            } else {
+                // Only inspect tiles in [minDistanceToSearch, maxDist]
+                val enemyTiles = civ.getEnemyTilesInDistanceNative(tile, maxDist)
+                var bestDist = Int.MAX_VALUE
+                if (enemyTiles != null) {
+                    for (et in enemyTiles) {
+                        val d = et.aerialDistanceTo(tile)
+                        if (d in minDistanceToSearch..maxDist && d < bestDist && doesTileHaveMilitaryEnemy(civ, et)) {
+                            bestDist = d
+                        }
+                    }
+                }
+                if (bestDist <= maxDist) {
+                    val list = mutableListOf<Pair<TileView, Int>>()
+                    if (enemyTiles != null) {
+                        for (et in enemyTiles) {
+                            if (et.aerialDistanceTo(tile) == bestDist && doesTileHaveMilitaryEnemy(civ, et)) {
+                                list.add(Pair(et, bestDist))
+                            }
+                        }
+                    }
+                    cache.distanceToClosestEnemyTiles[tile] = AutomationCache.ClosestEnemyTileData(bestDist, list)
+                    return bestDist
+                }
+                cache.distanceToClosestEnemyTiles[tile] = AutomationCache.ClosestEnemyTileData(maxDist, mutableListOf())
+                return notFoundDistance
+            }
+        }
+
         val tilesWithEnemyAtDistance: MutableList<Pair<TileView,Int>> = mutableListOf()
         // Search for nearby enemies and store the results
         for (i in minDistanceToSearch..maxDist) {
@@ -103,8 +154,31 @@ object ThreatManager {
             return tilesWithEnemies
 
 
-        // Search all tiles that haven't been searched yet up until madDist
+        // Search all tiles that haven't been searched yet up until maxDist
         val minDistanceToSearch = (tileData?.distanceSearched?.coerceAtLeast(0) ?: 0) + 1
+
+        val nativeEnemies = civ.getEnemyTilesInDistanceNative(tile, maxDist)
+        if (nativeEnemies != null) {
+            // Collect newly-discovered enemies in [minDistanceToSearch, maxDist], sorted by distance
+            val newlyFound = ArrayList<Pair<TileView, Int>>(nativeEnemies.size)
+            for (et in nativeEnemies) {
+                val d = et.aerialDistanceTo(tile)
+                if (d in minDistanceToSearch..maxDist) {
+                    newlyFound.add(Pair(et, d))
+                }
+            }
+            if (newlyFound.size > 1) newlyFound.sortBy { it.second }
+            for (pair in newlyFound) {
+                tilesWithEnemies.add(pair.first)
+                tileDataTilesWithEnemies.add(pair)
+            }
+            if (tileData != null) {
+                tileData.distanceSearched = maxOf(tileData.distanceSearched, maxDist)
+            } else {
+                cache.distanceToClosestEnemyTiles[tile] = AutomationCache.ClosestEnemyTileData(maxDist, tileDataTilesWithEnemies)
+            }
+            return tilesWithEnemies
+        }
 
         for (i in minDistanceToSearch..maxDist) {
             tile.getExploredTilesAtDistance(i).forEach { searchTile ->

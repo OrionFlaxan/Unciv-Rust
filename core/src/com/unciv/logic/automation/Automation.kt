@@ -14,6 +14,7 @@ import com.unciv.logic.map.TileMap
 import com.unciv.logic.map.tile.Tile
 import com.unciv.models.ruleset.Building
 import com.unciv.models.ruleset.INonPerpetualConstruction
+import com.unciv.models.ruleset.IConstruction
 import com.unciv.models.ruleset.PerpetualConstruction
 import com.unciv.models.ruleset.tile.ResourceType
 import com.unciv.models.ruleset.tile.TileImprovement
@@ -75,115 +76,167 @@ object Automation {
         return 1f
     }
 
+    /** Precomputed city-level invariants hoisted out of `CityPopulationManager.autoAssignPopulation`. */
+    internal class CityWorkRankContext(
+        val cityAIFocus: CityFocus,
+        val cityStatsObj: CityStats,
+        val allTechsAreResearched: Boolean,
+        val currentConstruction: IConstruction,
+        val isPerpetual: Boolean,
+        val avoidGrowth: Boolean,
+        val isSmallCity: Boolean,
+        val civHappiness: Int,
+        val civGoldNegative: Boolean,
+        val isAI: Boolean,
+        val popCount: Int,
+        val foodThresholdForHumanWeight: Float,
+        val growthNullifyingUnique: Boolean,
+        val growthBonusMultiplier: Float,
+        val specialistHappinessDelta: Float
+    ) {
+        @Readonly
+        fun foodModWeight(surplusFood: Float): Float {
+            if (civHappiness < -8) return 0f
+            if (isAI) return 1.5f
+            if (cityAIFocus == CityFocus.NoFocus) {
+                if (popCount < 5) return 2f
+                if (surplusFood > foodThresholdForHumanWeight) return 0.75f
+            }
+            return 1f
+        }
+    }
+
+    @Readonly
+    internal fun createCityWorkRankContext(city: City): CityWorkRankContext {
+        val cityAIFocus = city.getCityFocus()
+        val civInfo = city.civ
+        val currentConstruction = city.cityConstructions.getCurrentConstruction()
+        val civHappiness = civInfo.getHappiness()
+        val isAI = civInfo.isAI()
+        val popCount = city.population.population
+        val speed = civInfo.gameInfo.speed.modifier
+        val foodThreshold =
+            if (!isAI && cityAIFocus == CityFocus.NoFocus && popCount >= 5)
+                city.population.getFoodToNextPopulation() / (10f * speed)
+            else Float.POSITIVE_INFINITY
+
+        var nullifies = false
+        city.forEachMatchingUnique(UniqueType.NullifiesGrowth, city.state) { _: Unique ->
+            nullifies = true
+        }
+
+        var growthMult = 1f
+        if (!nullifies) {
+            city.forEachMatchingUnique(UniqueType.GrowthPercentBonus, city.state) { unique: Unique ->
+                if (city.matchesFilter(unique.params[1])) {
+                    growthMult += unique.params[0].toFloat() / 100f
+                }
+            }
+            if (city.isWeLoveTheKingDayActive() && civHappiness >= 0) {
+                growthMult += 0.25f
+            }
+        }
+
+        var specHapDelta = 0f
+        city.forEachMatchingUnique(UniqueType.UnhappinessFromPopulationTypePercentageChange, city.state) { unique: Unique ->
+            if (unique.params[1] == "Specialists" && city.matchesFilter(unique.params[2])) {
+                specHapDelta += unique.params[0].toFloat() / 100f
+            }
+        }
+
+        return CityWorkRankContext(
+            cityAIFocus = cityAIFocus,
+            cityStatsObj = city.cityStats,
+            allTechsAreResearched = civInfo.tech.allTechsAreResearched(),
+            currentConstruction = currentConstruction,
+            isPerpetual = currentConstruction is PerpetualConstruction,
+            avoidGrowth = city.avoidGrowth,
+            isSmallCity = popCount < 10,
+            civHappiness = civHappiness,
+            civGoldNegative = civInfo.stats.statsForNextTurn.gold < 0f,
+            isAI = isAI,
+            popCount = popCount,
+            foodThresholdForHumanWeight = foodThreshold,
+            growthNullifyingUnique = nullifies,
+            growthBonusMultiplier = growthMult,
+            specialistHappinessDelta = specHapDelta
+        )
+    }
+
+    @Readonly
+    internal fun rankStatsForCityWorkFast(
+        stats: Stats,
+        ctx: CityWorkRankContext,
+        surplusFood: Float,
+        areWeRankingSpecialist: Boolean
+    ): Float {
+        var food = stats.food
+        var prod = stats.production
+        var gold = stats.gold
+        var sci = stats.science
+        var cult = stats.culture
+        var hap = stats.happiness
+        var faith = stats.faith
+
+        if (areWeRankingSpecialist) {
+            hap -= ctx.specialistHappinessDelta
+            if (sci == 3f || sci >= 5f) sci *= 1.3f
+        }
+
+        if (ctx.cityStatsObj.canConvertFoodToProduction(surplusFood, ctx.currentConstruction)) {
+            prod += ctx.cityStatsObj.getProductionFromExcessiveFood(surplusFood + food) -
+                ctx.cityStatsObj.getProductionFromExcessiveFood(surplusFood)
+            food = 0f
+        }
+
+        var feedFood = 0f
+        if (surplusFood < 0f) feedFood = min(food, -surplusFood).coerceAtLeast(0f)
+        var growthFood = food - feedFood
+        if (ctx.avoidGrowth) growthFood = 0f
+
+        // Exact Stats.applyRankingWeights()
+        val foodBaseWeight = 14f
+        prod *= 12.01f
+        gold *= 6f
+        sci *= 9.01f
+        cult *= 8f
+        hap *= 10f
+        faith *= 7f
+
+        var weightedFood = feedFood * (foodBaseWeight * 8f)
+        if (!ctx.growthNullifyingUnique) {
+            val newGrowthFood = (growthFood * ctx.growthBonusMultiplier).coerceAtLeast(0f)
+            weightedFood += newGrowthFood * foodBaseWeight * ctx.foodModWeight(surplusFood)
+        }
+
+        if (ctx.isSmallCity) sci /= 2f
+        if (ctx.civGoldNegative) gold *= 2f
+        if (ctx.civHappiness < 5) hap *= 2f
+        if (ctx.allTechsAreResearched) sci = 0f
+        if (ctx.isPerpetual) prod /= 6f
+
+        val focus = ctx.cityAIFocus
+        for (stat in focus.statValuesForFocus) {
+            val mult = focus.getStatMultiplier(stat)
+            when (stat) {
+                Stat.Food -> if (weightedFood != 0f) weightedFood *= mult
+                Stat.Production -> if (prod != 0f) prod *= mult
+                Stat.Gold -> if (gold != 0f) gold *= mult
+                Stat.Science -> if (sci != 0f) sci *= mult
+                Stat.Culture -> if (cult != 0f) cult *= mult
+                Stat.Happiness -> if (hap != 0f) hap *= mult
+                Stat.Faith -> if (faith != 0f) faith *= mult
+            }
+        }
+
+        return weightedFood + prod + gold + sci + cult + hap + faith
+    }
+
     @Readonly
     fun rankStatsForCityWork(stats: Stats, city: City, areWeRankingSpecialist: Boolean): Float
         = timeThis("Automation.rankStatsForCityWork") {
-        val cityAIFocus = city.getCityFocus()
-        val yieldStats = stats.clone()
-        val cityStatsObj = city.cityStats
-        val civInfo = city.civ
-        val allTechsAreResearched = civInfo.tech.allTechsAreResearched()
-
-        if (areWeRankingSpecialist) {
-            // Specialist Happiness Percentage Change 0f-1f
-            city.forEachMatchingUnique(UniqueType.UnhappinessFromPopulationTypePercentageChange, city.state) { unique: Unique ->
-                if (unique.params[1] == "Specialists" && city.matchesFilter(unique.params[2]))
-                    yieldStats.happiness -= (unique.params[0].toFloat() / 100f)  // relative val is negative, make positive
-            }
-            if (yieldStats.science == 3f || yieldStats.science >= 5f )
-                yieldStats.science *= 1.3f
-        }
-
-        val surplusFood = city.cityStats.currentCityStats[Stat.Food]
-        val starving = surplusFood < 0
-        // If current Production converts Food into Production, then calculate increased Production Yield
-        if (cityStatsObj.canConvertFoodToProduction(surplusFood, city.cityConstructions.getCurrentConstruction())) {
-            // calculate delta increase of food->prod. This isn't linear
-            yieldStats.production += cityStatsObj.getProductionFromExcessiveFood(surplusFood+yieldStats.food) - cityStatsObj.getProductionFromExcessiveFood(surplusFood)
-            yieldStats.food = 0f  // all food goes to 0
-        }
-
-        // Split Food Yield into feedFood, amount needed to not Starve
-        // and growthFood, any amount above that
-        var feedFood = 0f
-        if (starving)
-            feedFood = min(yieldStats.food, -surplusFood).coerceAtLeast(0f)
-        var growthFood = yieldStats.food - feedFood // how much extra Food we yield
-        // Avoid Growth, only count Food that gets you not-starving, but no more
-        if (city.avoidGrowth) {
-            growthFood = 0f
-        }
-        yieldStats.food = 1f
-        
-        // Apply base weights
-        yieldStats.applyRankingWeights()
-
-        val foodBaseWeight = yieldStats.food
-
-        // If starving, need Food, so feedFood > 0
-        // scale feedFood by 14(base weight)*8(super important)
-        // By only scaling what we need to reach Not Starving by x8, we can pick a tile that gives
-        // exactly as much Food as we need to Not Starve that also has other good yields instead of
-        // always picking the Highest Food tile until Not Starving
-        yieldStats.food = feedFood * (foodBaseWeight * 8)
-        // growthFood is any additional food not required to meet Starvation
-
-        // Growth is penalized when Unhappy, see GlobalUniques.json
-        // No Growth if <-10, 1/4 if <0
-        // Reusing food growth code from CityStats.updateFinalStatList()
-        var growthNullifyingUnique = false
-        city.forEachMatchingUnique(UniqueType.NullifiesGrowth, city.state) { _: Unique ->
-            growthNullifyingUnique = true
-        }
-        if (!growthNullifyingUnique) {
-            var newGrowthFood = growthFood  // running count of growthFood
-            val cityStats = CityStats(city)
-            val growthBonuses = cityStats.getGrowthBonus(growthFood)
-            for (growthBonus in growthBonuses) {
-                newGrowthFood += growthBonus.value.food
-            }
-            if (city.isWeLoveTheKingDayActive() && city.civ.getHappiness() >= 0) {
-                newGrowthFood += growthFood / 4
-            }
-            newGrowthFood = newGrowthFood.coerceAtLeast(0f) // floor to 0 for safety
-            
-            yieldStats.food += newGrowthFood * foodBaseWeight * getFoodModWeight(city, surplusFood)
-        }
-
-        if (city.population.population < 10) {
-            // "small city" - we care more about food and less about global problems like gold science and culture
-            // Food already handled above. Gold/Culture have low weights in Stats already
-            yieldStats.science /= 2
-        }
-
-        if (city.civ.stats.statsForNextTurn.gold < 0) {
-            // We have a global problem, we need to deal with it before it leads to science loss
-            yieldStats.gold *= 2
-        }
-
-        if (city.civ.getHappiness() < 5) {
-            yieldStats.happiness *= 2
-        }
-
-        if (allTechsAreResearched) {
-            // Science is useless at this point
-            yieldStats.science *= 0
-        }
-
-        if (city.cityConstructions.getCurrentConstruction() is PerpetualConstruction) {
-            // With 4:1 conversion of production to science, production is overvalued by a factor (12*4)/7 = 6.9
-            yieldStats.production /= 6
-        }
-
-        // Apply City focus
-        for (stat in cityAIFocus.statValuesForFocus) {
-            val currentStat = yieldStats[stat]
-            if (currentStat == 0f) continue
-            val statMultiplier = cityAIFocus.getStatMultiplier(stat)
-            yieldStats[stat] = currentStat * statMultiplier
-        }
-
-        return yieldStats.sum()
+        val ctx = createCityWorkRankContext(city)
+        rankStatsForCityWorkFast(stats, ctx, city.cityStats.currentCityStats.food, areWeRankingSpecialist)
     }
 
     fun tryTrainMilitaryUnit(city: City) {

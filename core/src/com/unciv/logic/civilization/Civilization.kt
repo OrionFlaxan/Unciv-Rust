@@ -47,6 +47,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import com.unciv.logic.automation.Timers.Companion.timeThis
 import com.unciv.logic.civilization.managers.quests.QuestManager
+import com.unciv.utils.DebugUtils
 import kotlin.text.toFloat
 
 enum class Proximity : IsPartOfGameInfoSerialization {
@@ -114,6 +115,61 @@ class Civilization : IsPartOfGameInfoSerialization {
 
     @Transient
     var viewableTiles = setOf<Tile>()
+
+    /** Dense 0..civilizations.size-1 index assigned during GameInfo.setTransients() for NativeWorldMirror. */
+    @Transient
+    var civIndex: Int = -1
+
+    /** O(1) exploration bitset mirroring Tile.exploredBy (which remains serialized for 100% save compatibility). */
+    @Transient
+    var exploredTileBits: LongArray = LongArray(0)
+
+    @Transient
+    internal var exploredTileBitsMap: com.unciv.logic.map.TileMap? = null
+
+    fun ensureExploredBitsInitialized(tileMap: com.unciv.logic.map.TileMap) {
+        val tiles = tileMap.tileList
+        val words = (tiles.size + 63) ushr 6
+        if (exploredTileBitsMap !== tileMap || exploredTileBits.size != words) {
+            val bits = LongArray(words)
+            val id = civID
+            for (i in 0 until tiles.size) {
+                if (tiles[i].getExploredByIds().contains(id)) {
+                    bits[i ushr 6] = bits[i ushr 6] or (1L shl (i and 63))
+                }
+            }
+            exploredTileBits = bits
+            exploredTileBitsMap = tileMap
+        }
+    }
+
+    @Readonly
+    fun isExploredBitSet(tileIndex: Int): Boolean {
+        val w = tileIndex ushr 6
+        if (w < 0 || w >= exploredTileBits.size) return false
+        return ((exploredTileBits[w] ushr (tileIndex and 63)) and 1L) != 0L
+    }
+
+    fun setExploredBit(tileIndex: Int, explored: Boolean) {
+        val w = tileIndex ushr 6
+        if (w < 0 || w >= exploredTileBits.size) return
+        val mask = 1L shl (tileIndex and 63)
+        if (explored) {
+            exploredTileBits[w] = exploredTileBits[w] or mask
+        } else {
+            exploredTileBits[w] = exploredTileBits[w] and mask.inv()
+        }
+    }
+
+    @Readonly
+    fun countExploredTilesFast(): Int {
+        var total = 0
+        val bits = exploredTileBits
+        for (i in bits.indices) {
+            total += java.lang.Long.bitCount(bits[i])
+        }
+        return total
+    }
 
     /** For each tile some detector unit of ours can see, the unit filters ([UniqueType.CanSeeInvisibleUnits])
      *  it could detect there - independent of what (if anything) currently occupies the tile. */
@@ -888,7 +944,9 @@ class Civilization : IsPartOfGameInfoSerialization {
                 RankingType.Culture -> policies.adoptedPolicies.count { !Policy.isBranchCompleteByName(it) }
             
                 // Non vanilla ranking types
-                RankingType.TilesExplored -> gameInfo.tileMap.values.count { it.isExplored(this) }
+                RankingType.TilesExplored ->
+                    if (exploredTileBitsMap === gameInfo.tileMap && exploredTileBits.isNotEmpty() && !DebugUtils.VISIBLE_MAP && !isSpectator) countExploredTilesFast()
+                    else gameInfo.tileMap.values.count { it.isExplored(this) }
         }
     }
 

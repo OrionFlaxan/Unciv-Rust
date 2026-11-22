@@ -21,8 +21,27 @@ dependencies {
     mockitoAgent(libs.mockito) { isTransitive = false }
 }
 
+private fun rustHostTag(): String {
+    val os = (System.getProperty("os.name") ?: "").lowercase()
+    val osTag = when {
+        os.contains("win") -> "windows"
+        os.contains("mac") || os.contains("darwin") -> "macos"
+        else -> "linux"
+    }
+    val arch = (System.getProperty("os.arch") ?: "").lowercase()
+    val archTag = when {
+        arch == "amd64" || arch == "x86_64" -> "x86_64"
+        arch == "aarch64" || arch == "arm64" -> "arm64"
+        else -> arch
+    }
+    return "$osTag-$archTag"
+}
+
 tasks {
+    val rustNativeDir = rootProject.file("core/build/rust-natives/${rustHostTag()}")
+
     test {
+        dependsOn(rootProject.tasks.named("buildRustDesktop"))
         workingDir = file("../android/assets")
         testLogging.lifecycle {
             events(
@@ -35,9 +54,11 @@ tasks {
         }
 
         jvmArgumentProviders.add(MockitoAgentArgumentProvider(mockitoAgent))
+        systemProperty("unciv.nativeLibDir", rustNativeDir.absolutePath)
 
         // Forward latency-test save file path to the test JVM
         System.getProperty("unciv.nextTurnSaveFile")?.let { systemProperty("unciv.nextTurnSaveFile", it) }
+        System.getProperty("unciv.disableNative")?.let { systemProperty("unciv.disableNative", it) }
     }
 
     // Turn speed for the Objective Judge Horizon benchmark. A developer tool,
@@ -46,12 +67,15 @@ tasks {
     //
     //   ./gradlew :tests:ojhTurns -Pojh.args="--turns 250 --players 63 --map /path/map.json"
     register<JavaExec>("ojh") {
+        dependsOn(rootProject.tasks.named("buildRustDesktop"))
         group = "verification"
         description = "Measure turn speed or frame rate for OJH (see com.unciv.dev.OjhBenchmark)"
         mainClass.set("com.unciv.dev.OjhBenchmark")
         classpath = sourceSets["test"].runtimeClasspath
         workingDir = file("../android/assets")
         args = ((project.findProperty("ojh.args") as String?) ?: "").split(" ").filter { it.isNotEmpty() }
+        jvmArgs("-Dunciv.nativeLibDir=${rustNativeDir.absolutePath}")
+        System.getProperty("unciv.disableNative")?.let { jvmArgs("-Dunciv.disableNative=$it") }
         // The fps mode opens a real window, and GLFW on macOS insists on being
         // on the first thread of the process; headless AWT keeps AWT from
         // taking that same thread over (see OjhBenchmark.fps). Both are

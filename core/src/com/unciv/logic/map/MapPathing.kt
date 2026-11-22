@@ -53,6 +53,10 @@ object MapPathing {
      */
     @Readonly
     fun getRoadPath(civ: Civilization, startTile: Tile, endTile: Tile): List<Tile>? {
+        val mirror = startTile.tileMap.getOrCreateNativeWorld()
+        if (mirror != null) {
+            return mirror.findRoadPath(civ, startTile, listOf(endTile))
+        }
         return getConnection(civ,
             startTile,
             endTile,

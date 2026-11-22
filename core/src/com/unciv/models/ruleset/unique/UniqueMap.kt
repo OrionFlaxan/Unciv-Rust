@@ -45,12 +45,28 @@ open class UniqueMap() {
     fun isEmpty(): Boolean = tagUniqueMap.isEmpty()
     
     @Readonly
-    fun hasUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState) =
-        getUniques(uniqueType).any { it.conditionalsApply(state) && !it.isTimedTriggerable }
+    fun hasUnique(uniqueType: UniqueType, state: GameContext = GameContext.EmptyState): Boolean {
+        val uniques = typedUniqueMap[uniqueType] ?: return false
+        for (i in 0..<uniques.size) {
+            val u = uniques[i]
+            if (!u.isTimedTriggerable && u.conditionalsApply(state)) return true
+        }
+        return false
+    }
 
     @Readonly
-    fun hasUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState) =
-        getTagUniques(uniqueTag).any { it.conditionalsApply(state) && !it.isTimedTriggerable }
+    fun hasUnique(uniqueTag: String, state: GameContext = GameContext.EmptyState): Boolean {
+        val uniques = tagUniqueMap[uniqueTag] ?: return false
+        for (i in 0..<uniques.size) {
+            val u = uniques[i]
+            if (!u.isTimedTriggerable && u.conditionalsApply(state)) return true
+        }
+        return false
+    }
+
+    @Readonly
+    fun hasTypedUnique(uniqueType: UniqueType): Boolean =
+        typedUniqueMap.containsKey(uniqueType)
 
     @Readonly
     fun hasTagUnique(tagUnique: String) =

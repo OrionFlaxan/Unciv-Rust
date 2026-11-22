@@ -68,6 +68,14 @@ class MapUnitCache(private val mapUnit: MapUnit) {
 
     var hasStrengthBonusInRadiusUnique = false
     var hasCitadelPlacementUnique = false
+
+    /** Native pathing eligibility caches: true if any DoubleMovementOnTerrain has conditional modifiers. */
+    var hasConditionalDoubleMovement = false
+        private set
+
+    /** True if unit can carry air units (loaded carriers use Kotlin CarrierSlotMatcher). */
+    var isCarrierUnique = false
+        private set
     
     var state = GameContext.EmptyState
 
@@ -83,8 +91,10 @@ class MapUnitCache(private val mapUnit: MapUnit) {
         canMoveOnWater = mapUnit.hasUnique(UniqueType.CanMoveOnWater)
 
         doubleMovementInTerrain.clear()
+        hasConditionalDoubleMovement = false
         mapUnit.forEachMatchingUnique(UniqueType.DoubleMovementOnTerrain,
                 gameContext = GameContext.IgnoreConditionals, checkCivInfoUniques = true) { unique ->
+            if (unique.modifiers.isNotEmpty()) hasConditionalDoubleMovement = true
             val param = unique.params[0]
             val terrain = mapUnit.civ.gameInfo.ruleset.terrains[param]
             doubleMovementInTerrain[param] = DoubleMovement(unique = unique,
@@ -126,6 +136,7 @@ class MapUnitCache(private val mapUnit: MapUnit) {
         hasCitadelPlacementUnique = mapUnit.getMatchingUniques(UniqueType.ConstructImprovementInstantly)
             .mapNotNull { mapUnit.civ.gameInfo.ruleset.tileImprovements[it.params[0]] }
             .any { it.hasUnique(UniqueType.OneTimeTakeOverTilesInRadius) }
+        isCarrierUnique = mapUnit.hasUnique(UniqueType.CarryAirUnits) || mapUnit.hasUnique(UniqueType.CarryExtraAirUnits)
     }
 
     companion object {

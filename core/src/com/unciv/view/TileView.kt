@@ -158,8 +158,18 @@ class TileView internal constructor(private val tile: Tile, val tileMapView: Til
     /** Best road path from this tile to any of [destinations], or `null` if none is reachable. Pathing maps are kept in [cache]. */
     @Readonly fun getRoadPathToAny(destinations: Set<TileView>, maxBfsReachPadding: Int, cache: RoadPathingCache): List<TileView>? {
         val viewer = viewer ?: return null
-        // TODO: replace with multi-target AStar
+        if (destinations.isEmpty()) return null
         val maxTurns = maxBfsReachPadding + destinations.minOf { it.aerialDistanceTo(this) }
+        val mirror = tile.tileMap.getOrCreateNativeWorld()
+        if (mirror != null) {
+            val destTiles = ArrayList<Tile>(destinations.size)
+            for (d in destinations) destTiles.add(d.unwrap())
+            val path = mirror.findRoadPath(viewer, tile, destTiles, maxTurns * 2) ?: return null
+            val out = ArrayList<TileView>(path.size)
+            for (t in path) out.add(tileMapView.getTile(t))
+            return out
+        }
+        // TODO: replace with multi-target AStar
         val pathingMap = getRoadPathingMap(viewer, cache)
         val otherCity = pathingMap.bfsUntilMatchingTile(maxTurns) { it in destinations } ?: return null
         return pathingMap.getShortestPath(otherCity) // this just reads from cached results

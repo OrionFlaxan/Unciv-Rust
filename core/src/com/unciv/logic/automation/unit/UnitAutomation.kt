@@ -120,7 +120,7 @@ object UnitAutomation {
         // Focus all units without a specific target on the enemy city closest to one of our cities
         if (HeadTowardsEnemyCityAutomation.tryHeadTowardsEnemyCity(unitView)) return
 
-        if (tryHeadTowardsEncampment(unitView)) return
+        if (tryHeadTowardsEncampment(unitView, cache)) return
 
         if (tryGarrisoningLandUnit(unitView)) return
 
@@ -281,17 +281,15 @@ object UnitAutomation {
         return false
     }
 
-    private fun tryHeadTowardsEncampment(unitView: MapUnitView): Boolean {
+    private fun tryHeadTowardsEncampment(unitView: MapUnitView, cache: AutomationCache): Boolean {
         if (unitView.hasUnique(UniqueType.SelfDestructs)) return false // don't use single-use units against barbarians...
-        val knownEncampments = unitView.civ().cities().asSequence()
-            .flatMap { it.getCenterTile().getExploredTilesInDistance(6) }
-                .filter { it.isBarbarianEncampment() }
-            .distinct()
-        val encampmentsCloseToCities = knownEncampments.asSequence()
-            .sortedBy { it.aerialDistanceTo(unitView.getTile()) }
-        val encampmentToHeadTowards = encampmentsCloseToCities.firstOrNull { unitView.canReach(it) }
-            ?: return false
-        unitView.tryHeadTowards(encampmentToHeadTowards)
+        val knownEncampments = cache.getKnownEncampmentsNearCities(unitView.civ())
+        if (knownEncampments.isEmpty()) return false
+        val unitTile = unitView.getTile()
+        val encampmentsCloseToCities = knownEncampments.sortedBy { it.aerialDistanceTo(unitTile) }
+        val (bestIdx, _) = unitView.batchFirstReachable(encampmentsCloseToCities)
+        if (bestIdx < 0) return false
+        unitView.tryHeadTowards(encampmentsCloseToCities[bestIdx])
         return true
     }
 
