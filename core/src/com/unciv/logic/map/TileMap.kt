@@ -17,8 +17,12 @@ import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.models.ruleset.unique.UniqueMap
 import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.ruleset.unit.BaseUnit
+import com.unciv.nativeengine.NativeEngine
+import com.unciv.nativeengine.NativeWorldMirror
+import com.unciv.nativeengine.UncivRustNative
 import com.unciv.utils.addToMapOfSets
 import com.unciv.utils.contains
+import yairm210.purity.annotations.LocalState
 import yairm210.purity.annotations.Readonly
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -95,6 +99,25 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
     @Transient var leftX = 0
     @Transient var bottomY = 0
     @Transient var width = 0
+
+    /** Stateful Rust native world mirror (null when native library is unavailable or before first query). */
+    @Transient
+    var nativeWorld: NativeWorldMirror? = null
+
+    @Readonly @Suppress("purity")
+    fun getOrCreateNativeWorld(): NativeWorldMirror? {
+        if (!NativeEngine.isAvailable) return null
+        val existing = nativeWorld
+        if (existing != null && existing.handle != 0L && existing.numTiles == tileList.size) {
+            return existing
+        }
+        val rs = ruleset ?: return null
+        if (tileList.isEmpty() || tileMatrix.isEmpty()) return null
+        existing?.destroy()
+        val created = NativeWorldMirror.createOrNull(this, rs)
+        nativeWorld = created
+        return created
+    }
 
     @delegate:Transient
     val maxLatitude: Int by lazy { if (values.isEmpty()) 0 else values.maxOf { abs(it.latitude) } }
@@ -488,53 +511,48 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
     /** @return List of tiles visible from location [position] for a unit with sight range [sightDistance] */
     @Readonly
     fun getViewableTiles(position: HexCoord, sightDistance: Int, forAttack: Boolean = false): List<Tile> {
-        val aUnitHeight = get(position).unitHeight
-        val viewableTiles = mutableListOf(ViewableTile(
-            get(position),
-            aUnitHeight,
-            isVisible = true,
-            isAttackable = false
-        ))
-
-        for (i in 1..sightDistance+1) { // in each layer,
-            // This is so we don't use tiles in the same distance to "see over",
-            // that is to say, the "viewableTiles.contains(it) check will return false for neighbors from the same distance
-            val tilesToAddInDistanceI = ArrayList<ViewableTile>()
-
-            forEachTileAtDistance(position, i) { cTile -> // for each tile in that layer,
-                val cTileHeight = cTile.tileHeight
-
-                // For the sightdistance+1 layer - that's "one out of sight" - it's only visible if it's higher than the current tile
-                if (i == sightDistance + 1 && (cTileHeight <= aUnitHeight || forAttack))
-                    return@forEachTileAtDistance
-
-                /*
-            Okay so, if we're looking at a tile from height a to one with height c with a MAXIMUM HEIGHT of b in the middle,
-            we have several scenarios:
-            1. a>=b - I can see everything, b does not hide c (equals is 'flat plain' or 'string of hills' or 'hill viewing over forests')
-            3. a<b
-                3.1 b>=c - b hides c (hills hide other hills, forests, etc)
-                3.2 b<c - c is tall enough I can see it over b (hill+forest, mountain)
-
-            This can all be summed up as "I can see c if a=>b || c>b"
-            */
-                val bMinimumHighestSeenTerrainSoFar = viewableTiles
-                    .filter { it.tile.aerialDistanceTo(cTile) == 1 }
-                    .minOf { it.maxHeightSeenToTile }
-
-                tilesToAddInDistanceI.add(ViewableTile(
-                    cTile,
-                    max(cTileHeight, bMinimumHighestSeenTerrainSoFar),
-                    aUnitHeight >= bMinimumHighestSeenTerrainSoFar || cTileHeight > bMinimumHighestSeenTerrainSoFar,
-                    aUnitHeight >= bMinimumHighestSeenTerrainSoFar || cTile.unitHeight > bMinimumHighestSeenTerrainSoFar,
-                ))
-            }
-            viewableTiles.addAll(tilesToAddInDistanceI)
+        val originTile = get(position)
+        val mirror = getOrCreateNativeWorld()
+        if (mirror != null) {
+            return mirror.computeViewableTiles(originTile, sightDistance, forAttack)
         }
 
-        if (forAttack) return viewableTiles.filter { it.isAttackable }.map { it.tile }
+        // Optimized O(R^2) Kotlin fallback (eliminates O(R^4) linear scan over viewableTiles)
+        val aUnitHeight = originTile.unitHeight
+        val result = ArrayList<Tile>(1 + 3 * sightDistance * (sightDistance + 1))
+        if (!forAttack) result.add(originTile)
 
-        return viewableTiles.filter { it.isVisible }.map { it.tile }
+        @LocalState var prevRing = HashMap<Tile, Int>(8)
+        prevRing.put(originTile, aUnitHeight)
+
+        for (i in 1..sightDistance + 1) {
+            if (i == sightDistance + 1 && forAttack) break
+            @LocalState val curRing = HashMap<Tile, Int>(6 * i + 2)
+
+            forEachTileAtDistance(position, i) { cTile ->
+                val cTileHeight = cTile.tileHeight
+                if (i == sightDistance + 1 && cTileHeight <= aUnitHeight)
+                    return@forEachTileAtDistance
+
+                var bMin = Int.MAX_VALUE
+                for (nb in cTile.neighbors) {
+                    val h = prevRing[nb]
+                    if (h != null && h < bMin) bMin = h
+                }
+                if (bMin == Int.MAX_VALUE) return@forEachTileAtDistance
+
+                curRing.put(cTile, max(cTileHeight, bMin))
+                if (forAttack) {
+                    if (aUnitHeight >= bMin || cTile.unitHeight > bMin) result.add(cTile)
+                } else {
+                    if (aUnitHeight >= bMin || cTileHeight > bMin) result.add(cTile)
+                }
+            }
+            prevRing = curRing
+            if (prevRing.isEmpty()) break
+        }
+
+        return result
     }
 
     /** Build a list of incompatibilities of a map with a ruleset for the new game loader
@@ -632,6 +650,15 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
         val minColumn = tileList.minOf { HexMath.getColumn(it.position) }
         val maxColumn = tileList.maxOf { HexMath.getColumn(it.position) }
         width = maxColumn - minColumn + 1
+        nativeWorld?.let {
+            if (it.numTiles != tileList.size) {
+                it.destroy()
+                nativeWorld = null
+            } else {
+                it.topologyDirty = true
+                it.dynamicDirty = true
+            }
+        }
     }
 
     /** Initialize Civilization.neutralRoads based on Tile.roadOwner
@@ -888,12 +915,40 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
             }
         }
 
-        var landTiles = values.filter { it.isLand && !it.isImpassible() }
-        var currentContinent = 0
         continentSizes.clear()
 
         if (mode == AssignContinentsMode.Reassign)
             values.forEach { it.clearContinent() }
+
+        if (NativeEngine.isAvailable && tileList.isNotEmpty() && tileMatrix.isNotEmpty()) {
+            val n = tileList.size
+            val neighbors = IntArray(n * 6) { -1 }
+            val passableLand = ByteArray(n)
+            for (i in 0 until n) {
+                val t = tileList[i]
+                if (t.isLand && !t.isImpassible()) passableLand[i] = 1
+                val base = i * 6
+                var k = 0
+                for (nb in t.neighbors) {
+                    if (k < 6) neighbors[base + k++] = nb.zeroBasedIndex
+                }
+            }
+            val outContinents = IntArray(n) { -1 }
+            val sizes = UncivRustNative.nativeAssignContinents(neighbors, passableLand, outContinents)
+            for (i in 0 until n) {
+                val c = outContinents[i]
+                if (c >= 0) tileList[i].setContinent(c)
+            }
+            for (i in sizes.indices) {
+                continentSizes[i] = sizes[i]
+            }
+            nativeWorld?.topologyDirty = true
+            updateContinentsSortedBySize()
+            return
+        }
+
+        var landTiles = values.filter { it.isLand && !it.isImpassible() }
+        var currentContinent = 0
 
         while (landTiles.any()) {
             val bfs = BFS(landTiles[landTiles.size / 2]) { it.isLand && !it.isImpassible() }
@@ -907,6 +962,7 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
             currentContinent++
             landTiles = landTiles.filter { it !in continent }
         }
+        nativeWorld?.topologyDirty = true
         updateContinentsSortedBySize()
     }
 

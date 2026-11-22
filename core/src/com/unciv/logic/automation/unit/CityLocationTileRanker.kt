@@ -72,8 +72,11 @@ object CityLocationTileRanker {
             .sortedByDescending { it.second }
             .toList()
 
-        val bestReachableTile = possibleTileLocationsWithRank.firstOrNull { unit.canReach(it.first) }
-        if (bestReachableTile != null){
+        val candidateTiles = ArrayList<TileView>(possibleTileLocationsWithRank.size)
+        for (pair in possibleTileLocationsWithRank) candidateTiles.add(pair.first)
+        val (bestIdx, _) = unit.batchFirstReachable(candidateTiles)
+        if (bestIdx >= 0) {
+            val bestReachableTile = possibleTileLocationsWithRank[bestIdx]
             bestTilesToFoundCity.bestTile = bestReachableTile.first
             bestTilesToFoundCity.bestTileRank = bestReachableTile.second
         }

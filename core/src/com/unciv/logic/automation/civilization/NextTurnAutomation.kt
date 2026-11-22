@@ -423,12 +423,15 @@ object NextTurnAutomation {
     private fun automateUnits(civView: CivView, cache: AutomationCache) {
         val civInfo = civView.getCiv()
         val isAtWar = civView.isAtWar()
+        // Pre-sync native world & build multi-source threat field once for this civ's turn
+        civInfo.gameInfo.tileMap.getOrCreateNativeWorld()?.ensureThreatField(civInfo)
+
         // Instances present when the pass starts. addUnit/removeUnit replace UnitManager's list,
         // so units acquired later must not extend this pass. The instances stay mutable:
         // capturedBy changes owner on the same object, and an earlier action can do that to a
         // later one, so ownership and destruction are checked at each dispatch, not before the loop.
         val unitsAtStart = civView.getUnits()
-        fun unitsInPriorityOrder() = unitsAtStart.sortedBy { unit -> getUnitPriority(unit, isAtWar, cache) }
+        val initialSorted = sortUnitsByPriority(unitsAtStart, isAtWar, cache)
 
         val citiesRequiringManualPlacement = civInfo.getKnownCivs().filter { it.isAtWarWith(civInfo) }
             .flatMap { it.cities }
@@ -439,28 +442,46 @@ object NextTurnAutomation {
             }
             .toList()
 
-        for (unit in unitsInPriorityOrder()) {
+        for (unit in initialSorted) {
             if (!isStillOurUnit(unit, civView)) continue
             applyPromotions(unit)
         }
-        for (unit in unitsInPriorityOrder()) {
+        var anySettlerOrPartMoved = false
+        for (unit in initialSorted) {
             // settlers need to move before automateSettlerEscorting(),
             // move spaceship parts before that to make sure we're not blocking them
             if (!unit.hasUnique(UniqueType.SpaceshipPart) && !unit.hasUnique(UniqueType.FoundCity)) continue
             if (!isStillOurUnit(unit, civView)) continue
             UnitAutomation.automateUnitMoves(unit, cache)
+            anySettlerOrPartMoved = true
         }
 
         if (civView.cities().isNotEmpty()) automateSettlerEscorting(civView)
 
         for (city in citiesRequiringManualPlacement) automateCityConquer(civView, city, cache)
 
-        for (unit in unitsInPriorityOrder()) {
+        // Re-sort only if combat/city-conquer/settler moves could have altered priorities
+        val finalOrder = if (anySettlerOrPartMoved || citiesRequiringManualPlacement.isNotEmpty()) {
+            sortUnitsByPriority(unitsAtStart, isAtWar, cache)
+        } else {
+            initialSorted
+        }
+        for (unit in finalOrder) {
             // spaceship parts and settlers have already moved
             if (unit.hasUnique(UniqueType.SpaceshipPart) || unit.hasUnique(UniqueType.FoundCity)) continue
             if (!isStillOurUnit(unit, civView)) continue
             UnitAutomation.automateUnitMoves(unit, cache)
         }
+    }
+
+    private fun sortUnitsByPriority(units: List<MapUnitView>, isAtWar: Boolean, cache: AutomationCache): List<MapUnitView> {
+        if (units.size <= 1) return units
+        val pairs = ArrayList<Pair<MapUnitView, Int>>(units.size)
+        for (u in units) pairs.add(Pair(u, getUnitPriority(u, isAtWar, cache)))
+        pairs.sortBy { it.second }
+        val result = ArrayList<MapUnitView>(units.size)
+        for (p in pairs) result.add(p.first)
+        return result
     }
 
     /** False once an earlier action in this pass has captured or destroyed [unit]. */

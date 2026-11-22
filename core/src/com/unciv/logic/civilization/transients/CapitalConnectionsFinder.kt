@@ -43,6 +43,31 @@ class CapitalConnectionsFinder(private val civInfo: Civilization) {
         it != null && (it.techRequired==null || civInfo.tech.isResearched(it.techRequired!!)) }
 
     fun find(): Map<City, EnumSet<CapitalConnectionMedium>> = timeThis("CapitalConnectionsFinder.find") {
+        val capital = citiesToCheck.firstOrNull() ?: return citiesReachedToMediums
+        val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+        if (mirror != null) {
+            val cityList = openBordersCivCities.toList()
+            val capitalSlot = cityList.indexOf(capital)
+            if (capitalSlot >= 0) {
+                val masks = mirror.findCapitalConnections(
+                    civInfo, cityList, capitalSlot, roadIsResearched, railroadIsResearched
+                )
+                val result = HashMap<City, EnumSet<CapitalConnectionMedium>>(cityList.size)
+                for (i in cityList.indices) {
+                    val m = masks[i]
+                    if (m == 0) continue
+                    val set = EnumSet.noneOf(CapitalConnectionMedium::class.java)
+                    if ((m and com.unciv.nativeengine.UncivRustNative.MED_START) != 0) set.add(CapitalConnectionMedium.Start)
+                    if ((m and com.unciv.nativeengine.UncivRustNative.MED_ROAD) != 0) set.add(CapitalConnectionMedium.Road)
+                    if ((m and com.unciv.nativeengine.UncivRustNative.MED_RAILROAD) != 0) set.add(CapitalConnectionMedium.Railroad)
+                    if ((m and com.unciv.nativeengine.UncivRustNative.MED_HARBOR_FROM_ROAD) != 0) set.add(CapitalConnectionMedium.HarborFromRoad)
+                    if ((m and com.unciv.nativeengine.UncivRustNative.MED_HARBOR_FROM_RAILROAD) != 0) set.add(CapitalConnectionMedium.HarborFromRailroad)
+                    result[cityList[i]] = set
+                }
+                return result
+            }
+        }
+
         // We map which cities we've reached, to the mediums they've been reached by -
         // this is so we know that if we've seen which cities can be connected by port A, and one
         // of those is city B, then we don't need to check the cities that B can connect to by port,

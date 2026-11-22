@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["unciv-native"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"   # JNI entry points use catch_unwind so a Rust bug never kills the JVM/ART process
+debug = false

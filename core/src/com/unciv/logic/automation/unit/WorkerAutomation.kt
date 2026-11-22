@@ -147,15 +147,19 @@ class WorkerAutomation(
             fillWorkersPerCity(unitView)
             // Note, however, that the closest city to a tile isn't necessarily the owning city
             // Only move to cities with fewer workers nearby.
-            val closestUndevelopedCity = civ.cities()
+            val candidateCities = civ.cities()
                 .sortedBy { it.getCenterTile().aerialDistanceTo(currentTile) }
-                .firstOrNull {
+                .filter {
                     it != unitView.getTile().owningCity()
                     && workersPerCity[it] < workersPerCity[unitView.closestCity()]
                     && it.getTiles().any { tile -> tile.isLand
                         && tile.getVisibleUnits().none { unit -> unit.hasUnique(UniqueType.BuildImprovements) }
                         && (tile.improvementIsPillaged || tile.roadIsPillaged || tileHasWorkToDo(tile, unitView)) }
-                    && unitView.canReach(it.getCenterTile()) } //goto closest undeveloped city
+                }
+            val candidateTiles = ArrayList<TileView>(candidateCities.size)
+            for (c in candidateCities) candidateTiles.add(c.getCenterTile())
+            val (bestCityIdx, _) = unitView.batchFirstReachable(candidateTiles)
+            val closestUndevelopedCity = if (bestCityIdx >= 0) candidateCities[bestCityIdx] else null
 
             if (closestUndevelopedCity != null) {
                 debug("WorkerAutomation: %s -> head towards undeveloped city %s", unitView, closestUndevelopedCity.name)

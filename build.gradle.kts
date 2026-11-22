@@ -51,6 +51,9 @@ allprojects {
     configure<yairm210.purity.PurityConfiguration> {
         wellKnownPureFunctions = setOf(
             "io.ktor.http.Url", //constructor
+            "java.lang.Long.bitCount",
+            "java.lang.Float.floatToRawIntBits",
+            "java.lang.Float.intBitsToFloat",
         )
         wellKnownReadonlyFunctions = setOf(
             "com.badlogic.gdx.math.Vector2.len",
@@ -75,9 +78,13 @@ allprojects {
 
             "java.text.ParsePosition.getIndex",
             "java.util.BitSet.clone",
+            "java.util.BitSet.get",
 
             "kotlin.collections.orEmpty",
             "kotlin.collections.toTypedArray",
+            "kotlin.IntArray.get",
+            "kotlin.FloatArray.get",
+            "kotlin.LongArray.get",
         )
         wellKnownPureClasses = setOf(
             "java.text.DecimalFormatSymbols"
@@ -219,3 +226,13 @@ project(":core") {
         }
     }
 }
+
+tasks.register<Exec>("buildRustDesktop") {
+    group = "build"
+    description = "Compile Rust unciv-native shared library for the host desktop/test platform"
+    val skipRust = project.findProperty("skipRustBuild")?.toString()?.equals("true", ignoreCase = true) == true
+    onlyIf { !skipRust && file("rust/build-desktop.sh").exists() }
+    workingDir = projectDir
+    commandLine("bash", file("rust/build-desktop.sh").absolutePath)
+}
+

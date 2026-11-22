@@ -135,6 +135,23 @@ class CivView(civ: Civilization,
         civ.cities.forEach { it.cityStats.update() }
         return true
     }
+    @Readonly
+    fun getDistanceToClosestEnemyNative(tile: TileView, maxDist: Int, takeLargerValues: Boolean): Int? {
+        val mirror = civ.gameInfo.tileMap.getOrCreateNativeWorld() ?: return null
+        return mirror.getDistanceToClosestEnemy(civ, tile.unwrap(), maxDist, takeLargerValues)
+    }
+
+    @Readonly
+    fun getEnemyTilesInDistanceNative(tile: TileView, maxDist: Int): List<TileView>? {
+        val mirror = civ.gameInfo.tileMap.getOrCreateNativeWorld() ?: return null
+        val tiles = mirror.getEnemyTilesInDistance(civ, tile.unwrap(), maxDist)
+        if (tiles.isEmpty()) return emptyList()
+        val tmv = gameView.tileMapView
+        val out = ArrayList<TileView>(tiles.size)
+        for (t in tiles) out.add(tmv.getTile(t))
+        return out
+    }
+
     fun tryDismissPolicyPicker(): Boolean { civ.policies.shouldOpenPolicyPicker = false; return true }
     fun tryDismissMoveSpies(): Boolean { civ.espionageManager.dismissedShouldMoveSpies = true; return true }
     fun tryMarkMovedAutomatedUnits(): Boolean { civ.hasMovedAutomatedUnits = true; return true }

@@ -857,29 +857,34 @@ class MapUnit : IsPartOfGameInfoSerialization {
 
         // Set equality automatically determines if anything changed - https://kotlinlang.org/api/latest/jvm/stdlib/kotlin.collections/-abstract-set/equals.html
 
-        val shouldUpdateTiles = updateCivViewableTiles && oldViewableTiles != viewableTiles
-                // Don't bother updating if all previous and current viewable tiles are within our borders
-                && (oldViewableTiles.any { it !in civ.cache.ourTilesAndNeighboringTiles }
-                || viewableTiles.any { it !in civ.cache.ourTilesAndNeighboringTiles })
+        if (!updateCivViewableTiles) {
+            if (oldViewableTiles != viewableTiles) civ.cache.invalidateVisionSync()
+            return
+        }
 
-        if (!shouldUpdateTiles) return
+        if (oldViewableTiles == viewableTiles) return
 
-        val unfilteredTriggeredUniques = getTriggeredUniques(UniqueType.TriggerUponDiscoveringTile, GameContext.IgnoreConditionals).toList()
-        if (unfilteredTriggeredUniques.isNotEmpty()) {
-            val newlyExploredTiles = viewableTiles.filter { !it.isExplored(civ) }
-            for (tile in newlyExploredTiles) {
-                val state = cache.state
-                for (unique in unfilteredTriggeredUniques) {
-                    if (unique.getModifiers(UniqueType.TriggerUponDiscoveringTile)
-                            .any { tile.matchesFilter(it.params[0], civ) }
-                        && unique.conditionalsApply(state)
-                    )
-                        UniqueTriggerActivation.triggerUnique(unique, this)
+        val needsExploreTriggerCheck = oldViewableTiles.any { it !in civ.cache.ourTilesAndNeighboringTiles }
+                || viewableTiles.any { it !in civ.cache.ourTilesAndNeighboringTiles }
+
+        if (needsExploreTriggerCheck) {
+            val unfilteredTriggeredUniques = getTriggeredUniques(UniqueType.TriggerUponDiscoveringTile, GameContext.IgnoreConditionals).toList()
+            if (unfilteredTriggeredUniques.isNotEmpty()) {
+                val newlyExploredTiles = viewableTiles.filter { !it.isExplored(civ) }
+                for (tile in newlyExploredTiles) {
+                    val state = cache.state
+                    for (unique in unfilteredTriggeredUniques) {
+                        if (unique.getModifiers(UniqueType.TriggerUponDiscoveringTile)
+                                .any { tile.matchesFilter(it.params[0], civ) }
+                            && unique.conditionalsApply(state)
+                        )
+                            UniqueTriggerActivation.triggerUnique(unique, this)
+                    }
                 }
             }
         }
 
-        civ.cache.updateViewableTiles(explorerPosition)
+        civ.cache.onUnitVisionChanged(this, oldViewableTiles, viewableTiles, needsExploreTriggerCheck, explorerPosition)
     }
 
     /** Can accept a negative number to gain movement points */
@@ -1077,6 +1082,7 @@ class MapUnit : IsPartOfGameInfoSerialization {
         }
         moveThroughTile(tile)
         cache.updateUniques()
+        tile.tileMap.nativeWorld?.onTileUnitsChanged(tile)
     }
 
     fun startEscorting() {

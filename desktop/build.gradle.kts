@@ -59,13 +59,33 @@ val assetsDir = file("../android/assets")
 val discordDir = file("discord_rpc")
 val deployFolder = file("../deploy")
 
+private fun rustHostTag(): String {
+    val os = (System.getProperty("os.name") ?: "").lowercase()
+    val osTag = when {
+        os.contains("win") -> "windows"
+        os.contains("mac") || os.contains("darwin") -> "macos"
+        else -> "linux"
+    }
+    val arch = (System.getProperty("os.arch") ?: "").lowercase()
+    val archTag = when {
+        arch == "amd64" || arch == "x86_64" -> "x86_64"
+        arch == "aarch64" || arch == "arm64" -> "arm64"
+        else -> arch
+    }
+    return "$osTag-$archTag"
+}
+
 private fun JavaExec.configureCommon() {
-    dependsOn(tasks.getByName("classes"))
+    dependsOn(tasks.getByName("classes"), rootProject.tasks.named("buildRustDesktop"))
     mainClass.set(mainClassName)
     classpath = sourceSets.main.get().runtimeClasspath
     standardInput = System.`in`
     workingDir = assetsDir
-    jvmArgs(*Platform.current().vmArgs.map { "-$it" }.toTypedArray())
+    val nativeDir = rootProject.file("core/build/rust-natives/${rustHostTag()}")
+    jvmArgs(
+        *Platform.current().vmArgs.map { "-$it" }.toTypedArray(),
+        "-Dunciv.nativeLibDir=${nativeDir.absolutePath}"
+    )
     isIgnoreExitValue = true
 }
 
@@ -82,7 +102,7 @@ tasks.register<JavaExec>("debug") {
 
 tasks.register<Jar>("dist") {
     description = "Compiles the jar file"
-    dependsOn(tasks.getByName("classes"))
+    dependsOn(tasks.getByName("classes"), rootProject.tasks.named("buildRustDesktop"))
 
     // META-INF/INDEX.LIST and META-INF/io.netty.versions.properties are duplicated, but I don't know why
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -99,6 +119,10 @@ tasks.register<Jar>("dist") {
     exclude("mods", "SaveFiles", "MultiplayerFiles", "GameSettings.json", "lasterror.txt")
     // This is for the .dll and .so files to make the Discord RPC work on all desktops
     from(files(discordDir))
+    // Bundle Rust native library for classpath extraction in standalone JARs
+    from(rootProject.file("core/build/rust-natives")) {
+        into("natives")
+    }
     archiveFileName.set("${BuildConfig.appName}.jar")
 
     manifest {

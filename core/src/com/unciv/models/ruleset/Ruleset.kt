@@ -145,6 +145,30 @@ class Ruleset {
     val terrains = LinkedHashMap<String, Terrain>()
     val tileImprovements = LinkedHashMap<String, TileImprovement>()
     val tileResources = LinkedHashMap<String, TileResource>()
+    @Transient private var cachedResourceLocalUniqueCount: Int = -1
+    @Transient private var cachedResourceLocalUniqueTypes: java.util.EnumSet<UniqueType>? = null
+
+    /** O(1) check whether any TileResource in this ruleset defines a local unique of [uniqueType]. */
+    @Readonly @Suppress("purity")
+    fun hasResourceLocalUnique(uniqueType: UniqueType): Boolean {
+        val count = tileResources.size
+        var set = cachedResourceLocalUniqueTypes
+        if (set == null || cachedResourceLocalUniqueCount != count) {
+            val fresh = java.util.EnumSet.noneOf(UniqueType::class.java)
+            for (res in tileResources.values) {
+                for (u in res.uniqueObjects) {
+                    if (u.isLocalEffect && !u.isTimedTriggerable && u.type != null) {
+                        fresh.add(u.type)
+                    }
+                }
+            }
+            cachedResourceLocalUniqueTypes = fresh
+            cachedResourceLocalUniqueCount = count
+            set = fresh
+        }
+        return set.contains(uniqueType)
+    }
+
     val tutorials = LinkedHashMap<String, Tutorial>()
     val units = LinkedHashMap<String, BaseUnit>()
     val unitPromotions = LinkedHashMap<String, Promotion>()

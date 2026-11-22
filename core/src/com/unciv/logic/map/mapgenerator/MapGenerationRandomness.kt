@@ -115,6 +115,75 @@ class MapGenerationRandomness {
         return noiseFunction(nx, ny, nz, nOctaves, persistence, lacunarity, scale)
     }
 
+    /**
+     * Batch-computes Perlin or ridged Perlin noise for every tile in [tileMap] in one pass,
+     * hoisting SplitMix64 offsets and cylinder constants out of the loop and dispatching to
+     * Rust `perlin_batch` when available (bit-identical to per-tile [getNoise]).
+     */
+    fun getPerlinNoiseBatch(
+        tileMap: com.unciv.logic.map.TileMap,
+        seed: Double,
+        nOctaves: Int = 6,
+        persistence: Double = 0.5,
+        lacunarity: Double = 2.0,
+        scale: Double = 30.0,
+        ridged: Boolean = false
+    ): DoubleArray {
+        val tiles = tileMap.tileList
+        val n = tiles.size
+        val params = tileMap.mapParameters
+        val xs = DoubleArray(n)
+        val ys = DoubleArray(n)
+        val zs = DoubleArray(n)
+
+        if (!params.worldWrap) {
+            for (i in 0 until n) {
+                val wc = HexMath.hex2WorldCoords(tiles[i].position)
+                xs[i] = wc.x.toDouble()
+                ys[i] = wc.y.toDouble()
+                zs[i] = seed
+            }
+        } else {
+            val radius = if (params.shape == MapShape.rectangular) {
+                val width = params.mapSize.width
+                val adjustedWidth = if (width % 2 != 0) width - 1 else width
+                adjustedWidth / 2.0
+            } else params.mapSize.radius.toDouble()
+            val wrapPeriod = 3.0 * radius
+            val invWrapTwoPi = (2.0 * PI) / wrapPeriod
+            val cylinderRadius = wrapPeriod / (2.0 * PI)
+            val maxOffset = 256.0 * scale
+            val seedLong = seed.toLong()
+            val offsetX = (((seedLong * 0x9E3779B97F4A7C15uL.toLong()) ushr 32).toDouble() / 4294967296.0) * maxOffset
+            val offsetY = (((seedLong * 0xBF58476D1CE4E5B9uL.toLong()) ushr 32).toDouble() / 4294967296.0) * maxOffset
+            val offsetZ = (((seedLong * 0x94D049BB133111EBuL.toLong()) ushr 32).toDouble() / 4294967296.0) * maxOffset
+
+            for (i in 0 until n) {
+                val wc = HexMath.hex2WorldCoords(tiles[i].position)
+                val angle = (wc.x / wrapPeriod) * 2 * PI
+                xs[i] = cylinderRadius * cos(angle) + offsetX
+                ys[i] = cylinderRadius * sin(angle) + offsetY
+                zs[i] = wc.y.toDouble() + offsetZ
+            }
+            @Suppress("UNUSED_VARIABLE") val _unused = invWrapTwoPi
+        }
+
+        if (com.unciv.nativeengine.NativeEngine.isAvailable) {
+            return com.unciv.nativeengine.UncivRustNative.nativePerlinBatch(
+                xs, ys, zs, nOctaves, persistence, lacunarity, scale, ridged
+            )
+        }
+        val out = DoubleArray(n)
+        for (i in 0 until n) {
+            out[i] = if (ridged) {
+                Perlin.ridgedNoise3d(xs[i], ys[i], zs[i], nOctaves, persistence, lacunarity, scale)
+            } else {
+                Perlin.noise3d(xs[i], ys[i], zs[i], nOctaves, persistence, lacunarity, scale)
+            }
+        }
+        return out
+    }
+
     fun chooseSpreadOutLocations(number: Int, suitableTiles: List<Tile>, mapRadius: Int): ArrayList<Tile> {
         if (number <= 0) return ArrayList(0)
 

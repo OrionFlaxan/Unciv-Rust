@@ -753,7 +753,10 @@ class GameInfo : IsPartOfGameInfoSerialization, HasGameInfoSerializationVersion 
 
         // This needs to go before tileMap.setTransients, as units need to access
         // the nation of their civilization when setting transients
-        for (civInfo in civilizations) civInfo.gameInfo = this
+        for ((index, civInfo) in civilizations.withIndex()) {
+            civInfo.gameInfo = this
+            civInfo.civIndex = index
+        }
         for (civInfo in civilizations) {
             civInfo.setNationTransient()
             civInfo.cache.updateState()
@@ -770,6 +773,29 @@ class GameInfo : IsPartOfGameInfoSerialization, HasGameInfoSerializationVersion 
         setGlobalTransients()
 
         tileMap.setTransients(ruleset)
+
+        // Initialize O(1) exploredTileBits for all civilizations in one linear pass over tileList
+        run {
+            val numTiles = tileMap.tileList.size
+            val words = (numTiles + 63) ushr 6
+            val civById = HashMap<String, Civilization>(civilizations.size * 2)
+            for (civInfo in civilizations) {
+                civInfo.exploredTileBits = LongArray(words)
+                civInfo.exploredTileBitsMap = tileMap
+                civById[civInfo.civID] = civInfo
+            }
+            val tiles = tileMap.tileList
+            for (i in 0 until numTiles) {
+                val exploredBy = tiles[i].getExploredByIds()
+                if (exploredBy.isEmpty()) continue
+                val w = i ushr 6
+                val mask = 1L shl (i and 63)
+                for (civId in exploredBy) {
+                    val c = civById[civId] ?: continue
+                    c.exploredTileBits[w] = c.exploredTileBits[w] or mask
+                }
+            }
+        }
 
         // Temporary - All games saved in 4.12.15 turned into 'hexagonal non world wrapped'
         // Here we attempt to fix that
@@ -795,6 +821,8 @@ class GameInfo : IsPartOfGameInfoSerialization, HasGameInfoSerializationVersion 
         convertFortify()
 
         updateCivilizationState()
+
+        tileMap.nativeWorld?.dynamicDirty = true
 
         spaceResources.clear()
         spaceResources.addAll(ruleset.buildings.values.filter { it.hasUnique(UniqueType.SpaceshipPart) }

@@ -34,23 +34,158 @@ class TileStatFunctions(val tile: Tile) {
 
     @Readonly
     fun getTileStats(city: City?, observingCiv: Civilization?): Stats = timeThis("getTileStats") {
-        val statsBreakdown = getTileStatsBreakdown(city, observingCiv)
+        val gameContext = GameContext(civInfo = observingCiv, city = city, tile = tile)
 
-        val improvement = tile.getUnpillagedImprovement()
-        val road = tile.getUnpillagedRoad()
-
-        val percentageStats = getTilePercentageStats(observingCiv, city)
-        for ((cause, @LocalState stats) in statsBreakdown) {
-            val tileType = when (cause) {
-                improvement -> TilePercentageCategory.Improvement
-                road.name -> TilePercentageCategory.Road
-                else -> TilePercentageCategory.Terrain
+        @LocalState val terrainAcc = Stats()
+        var otherYieldsIgnored = false
+        for (terrain in tile.allTerrains) {
+            val nullify = terrain.hasUnique(UniqueType.NullifyYields, gameContext)
+            if (nullify || terrain.overrideStats) {
+                terrainAcc.clear()
             }
-            for ((stat, value) in percentageStats[tileType]!!)
-                stats[stat] *= value.toPercent()
+            terrainAcc.add(terrain)
+            terrain.forEachMatchingUnique(UniqueType.Stats, gameContext) { unique ->
+                terrainAcc.add(unique.stats)
+            }
+            if (nullify) {
+                otherYieldsIgnored = true
+                break
+            }
         }
 
-        return statsBreakdown.toStats()
+        val improvement = if (otherYieldsIgnored) null else tile.getUnpillagedTileImprovement()
+        val road = if (otherYieldsIgnored) null else tile.getUnpillagedRoadImprovement()
+
+        @LocalState val improvementAcc = Stats()
+        if (improvement != null) improvementAcc.add(improvement)
+        @LocalState val roadAcc = Stats()
+        if (road != null) roadAcc.add(road)
+
+        if (city != null) {
+            val addStats: (Unique) -> Unit = { unique: Unique ->
+                val tileType = unique.params[1]
+                if (improvement != null && improvement.matchesFilter(tileType, gameContext))
+                    improvementAcc.add(unique.stats)
+                else if (tile.matchesFilter(tileType, observingCiv))
+                    terrainAcc.add(unique.stats)
+                else if (road != null && road.matchesFilter(tileType, gameContext))
+                    roadAcc.add(unique.stats)
+            }
+            city.forEachMatchingUnique(UniqueType.StatsFromTiles, gameContext) { unique: Unique ->
+                if (city.matchesFilter(unique.params[2])) addStats(unique)
+            }
+            city.forEachMatchingUnique(UniqueType.StatsFromObject, gameContext, addStats)
+            city.forEachMatchingUnique(UniqueType.StatsFromTilesWithout, gameContext) { unique: Unique ->
+                if (city.matchesFilter(unique.params[3]) && !tile.matchesFilter(unique.params[2]))
+                    addStats(unique)
+            }
+        }
+
+        if (tile.isAdjacentToRiver()) {
+            val rTerrain = riverTerrain
+            if (rTerrain == null) {
+                terrainAcc.gold += 1f
+            } else {
+                terrainAcc.add(rTerrain)
+                rTerrain.forEachMatchingUnique(UniqueType.Stats, gameContext) { unique ->
+                    terrainAcc.add(unique.stats)
+                }
+            }
+        }
+
+        var minimumStats = if (tile.isCityCenter()) Stats.DefaultCityCenterMinimum else Stats.ZERO
+        if (observingCiv != null) {
+            val resource = tile.tileResource
+            if (observingCiv.canSeeResource(resource)) terrainAcc.add(resource)
+
+            if (improvement != null) {
+                improvementAcc.add(getExtraImprovementStats(improvement, observingCiv, city))
+                val ensureMinUnique = improvement
+                    .getMatchingUniques(UniqueType.EnsureMinimumStats, gameContext)
+                    .firstOrNull()
+                if (ensureMinUnique != null) minimumStats = ensureMinUnique.stats
+            }
+            if (road != null) {
+                roadAcc.add(getExtraImprovementStats(road, observingCiv, city))
+            }
+        }
+
+        if (minimumStats !== Stats.ZERO) {
+            for (stat in Stat.entries) {
+                val cur = terrainAcc[stat] + improvementAcc[stat] + roadAcc[stat]
+                if (cur < minimumStats[stat]) {
+                    terrainAcc[stat] = terrainAcc[stat] + (minimumStats[stat] - cur)
+                }
+            }
+        }
+
+        if (observingCiv != null && observingCiv.goldenAges.isGoldenAge()
+            && (terrainAcc.gold + improvementAcc.gold + roadAcc.gold) != 0f
+        ) {
+            terrainAcc.gold += 1f
+        }
+
+        // Percentage bonuses (zero allocation when no percent unique exists; non-null @LocalState Stats otherwise)
+        var hasPctUniques = false
+        if (city != null) {
+            city.forEachMatchingUnique(UniqueType.StatPercentFromObject, gameContext) { hasPctUniques = true }
+            if (!hasPctUniques) {
+                city.forEachMatchingUnique(UniqueType.AllStatsPercentFromObject, gameContext) { hasPctUniques = true }
+            }
+        } else if (observingCiv != null) {
+            observingCiv.forEachMatchingUnique(UniqueType.StatPercentFromObject, gameContext) { hasPctUniques = true }
+            if (!hasPctUniques) {
+                observingCiv.forEachMatchingUnique(UniqueType.AllStatsPercentFromObject, gameContext) { hasPctUniques = true }
+            }
+        }
+
+        if (hasPctUniques) {
+            @LocalState val pctTerrain = Stats()
+            @LocalState val pctImp = Stats()
+            @LocalState val pctRoad = Stats()
+
+            val unpillagedImp = tile.getUnpillagedTileImprovement()
+            val unpillagedRoad = tile.getUnpillagedRoadImprovement()
+
+            fun addPct(filter: String, stat: Stat, amount: Float) {
+                if (amount == 0f) return
+                if (unpillagedImp != null && unpillagedImp.matchesFilter(filter, gameContext)) {
+                    pctImp.add(stat, amount)
+                } else if (tile.matchesFilter(filter, observingCiv)) {
+                    pctTerrain.add(stat, amount)
+                } else if (unpillagedRoad != null && unpillagedRoad.matchesFilter(filter, gameContext)) {
+                    pctRoad.add(stat, amount)
+                }
+            }
+
+            if (city != null) {
+                city.forEachMatchingUnique(UniqueType.StatPercentFromObject, gameContext) { unique: Unique ->
+                    addPct(unique.params[2], Stat.valueOf(unique.params[1]), unique.params[0].toFloat())
+                }
+                city.forEachMatchingUnique(UniqueType.AllStatsPercentFromObject, gameContext) { unique: Unique ->
+                    val amount = unique.params[0].toFloat()
+                    val filter = unique.params[1]
+                    for (stat in Stat.entries) addPct(filter, stat, amount)
+                }
+            } else if (observingCiv != null) {
+                observingCiv.forEachMatchingUnique(UniqueType.StatPercentFromObject, gameContext) { unique: Unique ->
+                    addPct(unique.params[2], Stat.valueOf(unique.params[1]), unique.params[0].toFloat())
+                }
+                observingCiv.forEachMatchingUnique(UniqueType.AllStatsPercentFromObject, gameContext) { unique: Unique ->
+                    val amount = unique.params[0].toFloat()
+                    val filter = unique.params[1]
+                    for (stat in Stat.entries) addPct(filter, stat, amount)
+                }
+            }
+
+            for ((stat, v) in pctTerrain) terrainAcc[stat] *= v.toPercent()
+            for ((stat, v) in pctImp) improvementAcc[stat] *= v.toPercent()
+            for ((stat, v) in pctRoad) roadAcc[stat] *= v.toPercent()
+        }
+
+        terrainAcc.add(improvementAcc)
+        terrainAcc.add(roadAcc)
+        return terrainAcc
     }
 
     @Readonly

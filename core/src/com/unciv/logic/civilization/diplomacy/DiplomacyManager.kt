@@ -205,9 +205,21 @@ class DiplomacyManager() : IsPartOfGameInfoSerialization {
     @Transient
     /** Can civInfo enter otherCivInfo's tiles? */
     var hasOpenBorders = false
+        set(value) {
+            if (field != value) {
+                field = value
+                if (::civInfo.isInitialized) civInfo.gameInfo.tileMap.nativeWorld?.diploDirty = true
+            }
+        }
 
     var trades = ArrayList<Trade>()
     var diplomaticStatus = DiplomaticStatus.War
+        set(value) {
+            if (field != value) {
+                field = value
+                if (::civInfo.isInitialized) civInfo.gameInfo.tileMap.nativeWorld?.diploDirty = true
+            }
+        }
 
     /** Contains various flags (declared war, promised to not settle, declined luxury trade) and the number of turns in which they will expire.
      *  The JSON serialize/deserialize REFUSES to deserialize hashmap keys as Enums, so I'm forced to use strings instead =(
@@ -676,10 +688,12 @@ class DiplomacyManager() : IsPartOfGameInfoSerialization {
         }
         diplomaticModifiers[modifierString] = newValue
         if (diplomaticModifiers[modifierString] == 0f) diplomaticModifiers.remove(modifierString)
+        if (::civInfo.isInitialized) civInfo.gameInfo.tileMap.nativeWorld?.diploDirty = true
     }
 
     fun setModifier(modifier: DiplomaticModifiers, amount: Float) {
         diplomaticModifiers[modifier.name] = amount
+        if (::civInfo.isInitialized) civInfo.gameInfo.tileMap.nativeWorld?.diploDirty = true
     }
 
     /**
@@ -704,7 +718,11 @@ class DiplomacyManager() : IsPartOfGameInfoSerialization {
         return diplomaticModifiers[modifier.name]!!
     }
 
-    internal fun removeModifier(modifier: DiplomaticModifiers) = diplomaticModifiers.remove(modifier.name)
+    internal fun removeModifier(modifier: DiplomaticModifiers): Float? {
+        val removed = diplomaticModifiers.remove(modifier.name)
+        if (removed != null && ::civInfo.isInitialized) civInfo.gameInfo.tileMap.nativeWorld?.diploDirty = true
+        return removed
+    }
     @Readonly
     fun hasModifier(modifier: DiplomaticModifiers) = diplomaticModifiers.containsKey(modifier.name)
     

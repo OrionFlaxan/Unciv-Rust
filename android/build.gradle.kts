@@ -91,6 +91,15 @@ tasks.register("texturePacker") {
     }
 }
 
+tasks.register<Exec>("buildRustAndroid") {
+    group = "build"
+    description = "Compile Rust unciv-native shared libraries for all 4 Android ABIs (API 21+)"
+    val skipRust = project.findProperty("skipRustBuild")?.toString()?.equals("true", ignoreCase = true) == true
+    onlyIf { !skipRust && rootProject.file("rust/build-android.sh").exists() }
+    workingDir = rootProject.projectDir
+    commandLine("bash", rootProject.file("rust/build-android.sh").absolutePath)
+}
+
 // called every time gradle gets executed, takes the native dependencies of
 // the natives configuration, and extracts them to the proper libs/ folders
 // so they get packed with the APK.
@@ -111,7 +120,7 @@ tasks.register("copyAndroidNatives") {
             }
         }
     }
-    dependsOn("texturePacker")
+    dependsOn("texturePacker", "buildRustAndroid")
 }
 
 tasks.whenTaskAdded {

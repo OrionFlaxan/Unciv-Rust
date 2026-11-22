@@ -20,15 +20,17 @@ object HeadTowardsEnemyCityAutomation {
         if (unitView.getBaseUnit().isWaterUnit) return tryHeadTowardsEnemyNaval(unitView)
 
         // only focus on *attacking* 1 enemy at a time otherwise you'll lose on both fronts
-        val closestReachableEnemyCity = getEnemyCitiesByPriority(unitView)
-            .firstOrNull { unitView.canReach(it.getCenterTile()) }
-            ?: return false // No enemy city reachable
+        val enemyCities = getEnemyCitiesByPriority(unitView).toList()
+        if (enemyCities.isEmpty()) return false
+        val cityTiles = ArrayList<TileView>(enemyCities.size)
+        for (c in enemyCities) cityTiles.add(c.getCenterTile())
+        val (bestIdx, shortestPath) = unitView.batchFirstReachable(cityTiles)
+        if (bestIdx < 0 || shortestPath.isEmpty()) return false // No enemy city reachable
 
         return headTowardsEnemyCity(
             unitView,
-            closestReachableEnemyCity.getCenterTile(),
-            // This should be cached after the `canReach` call above.
-            unitView.getShortestPath(closestReachableEnemyCity.getCenterTile())
+            cityTiles[bestIdx],
+            shortestPath
         )
     }
 
@@ -97,7 +99,9 @@ object HeadTowardsEnemyCityAutomation {
                 compareByDescending<TileView> { it.aerialDistanceTo(targetTile) } // stay at max range
                     .thenBy { it.aerialDistanceTo(unitTile) }
             )
-        return candidates.firstOrNull { unitView.canReach(it) }
+            .toList()
+        val (idx, _) = unitView.batchFirstReachable(candidates)
+        return if (idx >= 0) candidates[idx] else null
     }
 
     @Readonly

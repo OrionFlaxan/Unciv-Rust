@@ -35,4 +35,25 @@ class AutomationCache {
         neighboringOwnCities.getOrPut(cityView) { cityView.getNeighboringOwnCities(maxDistance) }
 
     val distanceToClosestEnemyTiles = HashMap<TileView, ClosestEnemyTileData>()
+
+    @Cache private var knownEncampmentsCache: List<TileView>? = null
+    @Cache private var knownEncampmentsCityCount: Int = -1
+
+    /** Barbarian encampments within 6 tiles of any own city, computed once per civ turn instead of once per idle unit. */
+    @Readonly @Suppress("purity")
+    fun getKnownEncampmentsNearCities(civView: com.unciv.view.CivView): List<TileView> {
+        val cities = civView.cities()
+        val cached = knownEncampmentsCache
+        if (cached != null && knownEncampmentsCityCount == cities.size) {
+            return cached.filter { it.isBarbarianEncampment() }
+        }
+        val result = cities.asSequence()
+            .flatMap { it.getCenterTile().getExploredTilesInDistance(6) }
+            .filter { it.isBarbarianEncampment() }
+            .distinct()
+            .toList()
+        knownEncampmentsCache = result
+        knownEncampmentsCityCount = cities.size
+        return result
+    }
 }

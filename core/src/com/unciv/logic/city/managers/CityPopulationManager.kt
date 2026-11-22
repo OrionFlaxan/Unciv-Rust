@@ -9,6 +9,7 @@ import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.map.tile.Tile
 import com.unciv.models.Counter
 import com.unciv.models.ruleset.unique.UniqueType
+import com.unciv.models.stats.Stats
 import com.unciv.ui.components.extensions.toPercent
 import com.unciv.utils.withItem
 import com.unciv.utils.withoutItem
@@ -155,51 +156,105 @@ class CityPopulationManager : IsPartOfGameInfoSerialization {
 
     /** Only assigns free population */
     internal fun autoAssignPopulation(): Unit = timeThis("CityPopulationManager.autoAssignPopulation") {
-        city.cityStats.update()  // calculate current stats with current assignments
         val freePopulation = getFreePopulation()
-        if (freePopulation <= 0) return
+        if (freePopulation <= 0) {
+            city.cityStats.update()
+            return
+        }
+        city.cityStats.update(updateCivStats = false)  // calculate current stats with current assignments; final update() updates civ stats
 
         val cityStats = city.cityStats.currentCityStats
         city.currentGPPBonus = city.getGreatPersonPercentageBonus()  // pre-calculate for use in Automation.rankSpecialist
         var specialistFoodBonus = 2f  // See CityStats.calcFoodEaten()
         specialistFoodBonus = 2f - specialistFoodBonus
 
-        val tilesToEvaluate = city.getWorkableTiles()
-            .filterNot { it.isBlockaded() }.toList().asSequence()
+        val rankCtx = Automation.createCityWorkRankContext(city)
 
-        // Calculate stats once - but the *ranking of those stats* is dynamic and depends on what the city needs
-        val tileStats = tilesToEvaluate
-            .filterNot { it.providesYield() }
-            .associateWith { it.stats.getTileStats(city, city.civ)}
+        val candidateTiles = ArrayList<Tile>(36)
+        val candidateStats = ArrayList<Stats>(36)
+        for (t in city.getWorkableTiles()) {
+            if (!t.isBlockaded() && !t.providesYield()) {
+                candidateTiles.add(t)
+                candidateStats.add(t.stats.getTileStats(city, city.civ))
+            }
+        }
+        val tileCount = candidateTiles.size
+        val tileWorked = BooleanArray(tileCount)
 
-        val maxSpecialists = getMaxSpecialists().asSequence()
+        val maxSpecialistsMap = if (city.manualSpecialists) null else getMaxSpecialists()
+        val specNames: Array<String>?
+        val specMax: IntArray?
+        val specStats: Array<Stats>?
+        val specGpp: FloatArray?
+        if (maxSpecialistsMap != null && maxSpecialistsMap.isNotEmpty()) {
+            val n = maxSpecialistsMap.size
+            val rulesetSpecs = city.getRuleset().specialists
+            val gppScale = (100 + city.currentGPPBonus) / 100f
+            specNames = Array(n) { "" }
+            specMax = IntArray(n)
+            specStats = Array(n) { Stats.ZERO }
+            specGpp = FloatArray(n)
+            var idx = 0
+            for ((k, v) in maxSpecialistsMap) {
+                specNames[idx] = k
+                specMax[idx] = v
+                specStats[idx] = city.cityStats.getStatsOfSpecialist(k)
+                val info = rulesetSpecs[k]
+                specGpp[idx] = if (info != null) info.greatPersonPoints.sumValues().toFloat() * gppScale else 0f
+                idx++
+            }
+        } else {
+            specNames = null
+            specMax = null
+            specStats = null
+            specGpp = null
+        }
 
         repeat(freePopulation) {
-            //evaluate tiles
-            val bestTileAndRank = tilesToEvaluate
-                .filterNot { it.providesYield() } // Changes with every tile assigned
-                .associateWith { Automation.rankStatsForCityWork(tileStats[it]!!, city, false) }
-                // We need to make sure that we work the same tiles as last turn on a tile
-                // so that our workers know to prioritize this tile and don't move to the other tile
-                // This was just the easiest way I could think of.
-                .maxWithOrNull( compareBy({ it.value }, { it.key.longitude }, { it.key.latitude }))
-            val bestTile = bestTileAndRank?.key
-            val valueBestTile = bestTileAndRank?.value ?: 0f
+            val surplusFood = cityStats.food
+            // Evaluate unworked tiles without allocating Maps, Pairs, Stats, or CityStats
+            var bestTileIdx = -1
+            var bestTileRank = Float.NEGATIVE_INFINITY
+            var bestLon = Int.MIN_VALUE
+            var bestLat = Int.MIN_VALUE
+            for (i in 0 until tileCount) {
+                if (tileWorked[i]) continue
+                val t = candidateTiles[i]
+                val rank = Automation.rankStatsForCityWorkFast(candidateStats[i], rankCtx, surplusFood, false)
+                if (bestTileIdx < 0 ||
+                    rank > bestTileRank ||
+                    (rank == bestTileRank && (t.longitude > bestLon || (t.longitude == bestLon && t.latitude > bestLat)))
+                ) {
+                    bestTileIdx = i
+                    bestTileRank = rank
+                    bestLon = t.longitude
+                    bestLat = t.latitude
+                }
+            }
+            val valueBestTile = if (bestTileIdx >= 0) bestTileRank else 0f
 
-            val bestJobAndRank = if (city.manualSpecialists) null
-                else maxSpecialists
-                    .filter { specialistAllocations[it.key] < it.value }
-                    .map { it.key }
-                    .associateWith { Automation.rankSpecialist(it, city) }
-                    .maxByOrNull { it.value }
-            val bestJob = bestJobAndRank?.key
-            val valueBestSpecialist = bestJobAndRank?.value ?: 0f
+            var bestJob: String? = null
+            var valueBestSpecialist = 0f
+            if (specNames != null && specMax != null && specStats != null && specGpp != null) {
+                var bestSpecRank = Float.NEGATIVE_INFINITY
+                for (i in specNames.indices) {
+                    val name = specNames[i]
+                    if (specialistAllocations[name] >= specMax[i]) continue
+                    val rank = Automation.rankStatsForCityWorkFast(specStats[i], rankCtx, surplusFood, true) + specGpp[i]
+                    if (bestJob == null || rank > bestSpecRank) {
+                        bestJob = name
+                        bestSpecRank = rank
+                    }
+                }
+                if (bestJob != null) valueBestSpecialist = bestSpecRank
+            }
 
-            //assign population
+            // Assign population
             if (valueBestTile > valueBestSpecialist) {
-                if (bestTile != null) {
-                    city.workTile(bestTile)
-                    cityStats.food += tileStats[bestTile]!!.food
+                if (bestTileIdx >= 0) {
+                    tileWorked[bestTileIdx] = true
+                    city.workTile(candidateTiles[bestTileIdx])
+                    cityStats.food += candidateStats[bestTileIdx].food
                 }
             } else if (bestJob != null) {
                 specialistAllocations.add(bestJob, 1)

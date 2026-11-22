@@ -2,10 +2,13 @@ package com.unciv.logic.files
 
 import com.badlogic.gdx.files.FileHandle
 import com.unciv.json.json
+import com.unciv.nativeengine.NativeEngine
+import com.unciv.nativeengine.UncivRustNative
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.StringWriter
 import java.util.Base64
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
@@ -13,12 +16,20 @@ import java.util.zip.GZIPOutputStream
 object FileConversions {
 
     fun zip(data: String): String {
+        if (NativeEngine.isAvailable) {
+            val encoded = UncivRustNative.nativeGzipBase64Encode(data.toByteArray(Charsets.UTF_8), 6)
+            if (encoded.isNotEmpty()) return String(encoded, Charsets.ISO_8859_1)
+        }
         val bos = ByteArrayOutputStream()
         zippedOutputStream(bos).use { it.write(data.toByteArray(Charsets.UTF_8)) }
         return bos.toString(Charsets.UTF_8.name())
     }
 
     fun unzip(data: String): String {
+        if (NativeEngine.isAvailable) {
+            val decoded = UncivRustNative.nativeGzipBase64Decode(data.toByteArray(Charsets.ISO_8859_1))
+            if (decoded != null) return String(decoded, Charsets.UTF_8)
+        }
         return unzippedInputStream(ByteArrayInputStream(data.toByteArray(Charsets.UTF_8))).use {
             it.readBytes().toString(Charsets.UTF_8)
         }
@@ -37,7 +48,17 @@ object FileConversions {
 
     /** Reads [file] as JSON of [type], transparently gunzip+base64-decoding it if that's how it was saved -
      *  otherwise (or if that fails), falls back to reading it as plain JSON text. */
-    fun <T> readJson(file: FileHandle, type: Class<T>): T? = readJson(file.read(), type)
+    fun <T> readJson(file: FileHandle, type: Class<T>): T? {
+        if (NativeEngine.isAvailable) {
+            val raw = file.readBytes()
+            val decoded = UncivRustNative.nativeGzipBase64Decode(raw)
+            val jsonBytes = decoded ?: raw
+            return ByteArrayInputStream(jsonBytes).reader(Charsets.UTF_8).use { reader ->
+                json().fromJson(type, reader)
+            }
+        }
+        return readJson(file.read(), type)
+    }
 
     /** Reads [input] as JSON of [type] without buffering the full text, transparently gunzip+base64-decoding it
      *  if that's how it was sent - otherwise (or if that fails), falls back to reading it as plain JSON text.
@@ -65,6 +86,15 @@ object FileConversions {
     /** Writes [obj] as JSON to [file], gzip-compressing and base64-encoding it first if [zip] is true. */
     fun writeJson(file: FileHandle, obj: Any, zip: Boolean) {
         if (zip) {
+            if (NativeEngine.isAvailable) {
+                val sw = StringWriter(65536)
+                json().toJson(obj, sw)
+                val encoded = UncivRustNative.nativeGzipBase64Encode(sw.toString().toByteArray(Charsets.UTF_8), 6)
+                if (encoded.isNotEmpty()) {
+                    file.writeBytes(encoded, false)
+                    return
+                }
+            }
             zippedOutputStream(file.write(false)).writer(Charsets.UTF_8).use {
                 json().toJson(obj, it)
             }

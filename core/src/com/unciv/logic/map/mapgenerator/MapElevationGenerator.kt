@@ -48,9 +48,12 @@ internal class MapElevationGenerator(
 
         tileMap.setTransients(ruleset)
 
-        for (tile in tileMap.values) {
+        val noise = randomness.getPerlinNoiseBatch(tileMap, elevationSeed, scale = 2.0)
+        val tiles = tileMap.tileList
+        for (i in 0 until tiles.size) {
+            val tile = tiles[i]
             if (tile.isWater) continue
-            val elevation = randomness.getPerlinNoise(tile, elevationSeed, scale = 2.0).powSigned(exponent)
+            val elevation = noise[i].powSigned(exponent)
             if (elevation > 0.7 && mountains.isNotEmpty()) {
                 applyTerrain(tile, mountains)
             } else if (elevation > 0.5 && hills.isNotEmpty()) {

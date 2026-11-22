@@ -326,6 +326,14 @@ object MotivationToAttackAutomation {
      */
     @Readonly
     private fun getAttackPathsModifier(civInfo: Civilization, otherCiv: Civilization, targetCitiesWithOurCity: List<Pair<City, City>>): Float {
+        val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+        val capital = civInfo.getCapital(true)
+        if (mirror != null && capital != null) {
+            return mirror.evalAttackPaths(
+                civInfo, otherCiv, targetCitiesWithOurCity,
+                capital.getCenterTile(), otherCiv.cities
+            )
+        }
 
         @Readonly
         fun isTileCanMoveThrough(civInfo: Civilization, tile: Tile): Boolean {
