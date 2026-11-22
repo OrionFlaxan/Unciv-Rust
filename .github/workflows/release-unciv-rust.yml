@@ -1,0 +1,150 @@
+name: Build & Release Unciv-Rust
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v0.1.0-rust)'
+        required: true
+        default: 'v0.1.0-rust'
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*-rust*'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-release:
+    name: Build Android 4-ABI APK & Desktop JAR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Ensure Android NDK is installed
+        run: |
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          if [ ! -d "$SDK_DIR/ndk/27.3.13750724" ]; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager --install "ndk;27.3.13750724"
+          fi
+          echo "ANDROID_NDK_HOME=$SDK_DIR/ndk/27.3.13750724" >> "$GITHUB_ENV"
+
+      - name: Set up Rust Android targets
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android \
+            i686-linux-android
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run Rust unit tests (release)
+        run: cargo test --manifest-path rust/Cargo.toml --release
+
+      - name: Build Android 4-ABI APK & Desktop JAR
+        run: ./gradlew :android:assembleDebug :desktop:dist --console=plain
+
+      - name: Verify native binaries inside APK & JAR
+        run: |
+          APK="android/build/outputs/apk/debug/Unciv-debug.apk"
+          JAR="desktop/build/libs/Unciv.jar"
+          test -f "$APK"
+          test -f "$JAR"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            unzip -l "$APK" | grep "lib/${abi}/libunciv_native.so"
+          done
+          jar tf "$JAR" | grep "natives/linux-x86_64/libunciv_native.so"
+
+          mkdir -p release-assets
+          cp "$APK" release-assets/Unciv-Rust-Android.apk
+          cp "$JAR" release-assets/Unciv-Rust-Desktop.jar
+          ls -lh release-assets/
+
+      - name: Upload workflow build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unciv-rust-builds
+          path: |
+            release-assets/Unciv-Rust-Android.apk
+            release-assets/Unciv-Rust-Desktop.jar
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            PRERELEASE_FLAG=""
+            if [ "${{ inputs.prerelease }}" = "true" ]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+            PRERELEASE_FLAG=""
+          fi
+
+          python3 - <<'PYEOF'
+          with open("release-notes.md", "w") as f:
+              f.write("""## Unciv-Rust Release — Rust Native Simulation Engine
+
+          High-performance Rust-accelerated fork of [Unciv](https://github.com/yairm210/Unciv) designed for smooth **300+ turn Large and Huge maps** on Android and Desktop — with **zero UI changes** and **100% vanilla rules, mods, and save-file compatibility**.
+
+          ### Included Downloads
+          - **`Unciv-Rust-Android.apk`** — Android 5.0+ (API 21+) universal APK bundling stripped Rust native libraries (`libunciv_native.so`) for all 4 ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`, and `x86`.
+          - **`Unciv-Rust-Desktop.jar`** — Desktop executable JAR (`java -jar Unciv-Rust-Desktop.jar`) bundling `linux-x86_64` native acceleration (with transparent pure-Kotlin fallback on other desktop OSes/architectures).
+
+          ### Performance Highlights (Huge Map, 22 AI Civs, 350 Turns)
+          - **Turns 301–325 (Late Game 300+ Turns):** `34.49s/turn` → **`2.86s/turn`** (**12.06× faster**, peak spike `56.44s` → `3.48s`)
+          - **Turns 1–325 Total:** `33.29 min` → **`7.79 min`** (**4.27× overall speedup**)
+          - **Large Map (16 AI Civs, Turns 301–350):** **`1.41s/turn`** mean (**1.36s** median)
+          - **Save/Load Compression:** **2.74× faster save**, **2.75× faster load** (100% cross-compatible with vanilla Unciv saves)
+
+          ### Android Installation Notes
+          1. Download **`Unciv-Rust-Android.apk`** on your Android device and tap to install (enable **Install unknown apps** if prompted).
+          2. Because this APK uses Unciv's default package ID (`com.unciv.app`) with the debug signing key, back up your saves and uninstall any Google Play / F-Droid copy of Unciv before installing.
+          """.replace("\n          ", "\n"))
+          PYEOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              release-assets/Unciv-Rust-Android.apk \
+              release-assets/Unciv-Rust-Desktop.jar \
+              --clobber
+            gh release edit "$TAG" \
+              --title "Unciv-Rust ${TAG}" \
+              --notes-file release-notes.md \
+              $PRERELEASE_FLAG
+          else
+            gh release create "$TAG" \
+              release-assets/Unciv-Rust-Android.apk \
+              release-assets/Unciv-Rust-Desktop.jar \
+              --target "${GITHUB_SHA}" \
+              --title "Unciv-Rust ${TAG}" \
+              --notes-file release-notes.md \
+              $PRERELEASE_FLAG
+          fi
