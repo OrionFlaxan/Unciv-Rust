@@ -7,9 +7,11 @@
 pub mod ai;
 pub mod compression;
 pub mod connectivity;
+pub mod flowfield;
 pub mod mapgen;
 pub mod pathing;
 pub mod scratch;
+pub mod turbo_ai;
 pub mod vision;
 pub mod world;
 

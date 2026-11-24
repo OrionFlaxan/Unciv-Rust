@@ -94,6 +94,8 @@ class GameSettings {
     var continuousRendering = false
     /** User override for using a plain SpriteBatch; null = automatic, see [isAlternativeRenderingEnabled] */
     var alternativeRendering: Boolean? = null
+    /** Accelerates single-player AI unit combat & flow-field planning via multi-threaded Rust (auto-disabled in online multiplayer) */
+    var turboRustAi = true
 
     //// Experimental
     var unitMovementButtonAnimation = false
@@ -230,6 +232,18 @@ class GameSettings {
      *  TL;DR the Mali-G68 GPU gives horrendous results with TextureArrayBatch, all other GPUs should default to false. */
     fun isAlternativeRenderingEnabled() =
         alternativeRendering ?: (Gdx.graphics?.glVersion?.rendererString == "Mali-G68")
+
+    /**
+     * Resolves whether **Turbo Rust Native AI** is active for the current game.
+     * Automatically disabled in Online Multiplayer for strict cross-client determinism.
+     * Supports `-Dunciv.turboRustAi=true|false` JVM property override for A/B benchmarking and tests.
+     */
+    fun isTurboRustAiEnabled(isOnlineMultiplayer: Boolean = false): Boolean {
+        if (isOnlineMultiplayer) return false
+        val overrideProp = System.getProperty("unciv.turboRustAi")
+        if (overrideProp != null) return overrideProp.equals("true", ignoreCase = true)
+        return turboRustAi
+    }
 
     fun save() {
         if (Gdx.app == null) return // Simulation mode from ConsoleLauncher

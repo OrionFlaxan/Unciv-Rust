@@ -1,8 +1,8 @@
 [package]
 name = "unciv-native"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Native (Rust) performance engine for Unciv: pathfinding, line-of-sight, map generation and save compression"
+description = "Native (Rust + Rayon) performance engine for Unciv: multi-threaded flow-fields, AI combat planning, pathfinding, line-of-sight, map generation and save compression"
 license = "MPL-2.0"
 publish = false
 
@@ -14,3 +14,4 @@ crate-type = ["cdylib", "rlib"]
 jni = { version = "0.21", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 base64 = "0.22"
+rayon = "1.10"

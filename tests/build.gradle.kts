@@ -59,6 +59,7 @@ tasks {
         // Forward latency-test save file path to the test JVM
         System.getProperty("unciv.nextTurnSaveFile")?.let { systemProperty("unciv.nextTurnSaveFile", it) }
         System.getProperty("unciv.disableNative")?.let { systemProperty("unciv.disableNative", it) }
+        System.getProperty("unciv.turboRustAi")?.let { systemProperty("unciv.turboRustAi", it) }
     }
 
     // Turn speed for the Objective Judge Horizon benchmark. A developer tool,
@@ -76,6 +77,7 @@ tasks {
         args = ((project.findProperty("ojh.args") as String?) ?: "").split(" ").filter { it.isNotEmpty() }
         jvmArgs("-Dunciv.nativeLibDir=${rustNativeDir.absolutePath}")
         System.getProperty("unciv.disableNative")?.let { jvmArgs("-Dunciv.disableNative=$it") }
+        System.getProperty("unciv.turboRustAi")?.let { jvmArgs("-Dunciv.turboRustAi=$it") }
         // The fps mode opens a real window, and GLFW on macOS insists on being
         // on the first thread of the process; headless AWT keeps AWT from
         // taking that same thread over (see OjhBenchmark.fps). Both are

@@ -119,6 +119,19 @@ class TileMap(initialCapacity: Int = 10) : IsPartOfGameInfoSerialization {
         return created
     }
 
+    /**
+     * Adopts a fast `memcpy`-cloned Rust static topology handle from [source] (e.g. from the previous
+     * turn's [GameInfo] in `WorldScreen.nextTurn()`), avoiding a full 4,921-tile JNI topology sync.
+     */
+    fun adoptClonedNativeTopology(source: NativeWorldMirror?): Boolean {
+        if (source == null || !NativeEngine.isAvailable) return false
+        if (source.numTiles != tileList.size || tileList.isEmpty()) return false
+        val cloned = source.cloneTopologyFor(this) ?: return false
+        nativeWorld?.destroy()
+        nativeWorld = cloned
+        return true
+    }
+
     @delegate:Transient
     val maxLatitude: Int by lazy { if (values.isEmpty()) 0 else values.maxOf { abs(it.latitude) } }
 

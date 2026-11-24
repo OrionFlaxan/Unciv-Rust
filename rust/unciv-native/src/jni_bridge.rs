@@ -6,8 +6,10 @@
 use crate::ai;
 use crate::compression;
 use crate::connectivity;
+use crate::flowfield;
 use crate::mapgen;
 use crate::pathing::{self, UnitProfile};
+use crate::turbo_ai::{self, TurboUnitInput};
 use crate::vision;
 use crate::world::NativeWorld;
 
@@ -255,6 +257,7 @@ pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeSyncDyn
         w.civ_passable_impassable_mask = read_u64_vec(&env, &civ_passable_impassable_mask);
         w.zoc_dirty = true;
         w.threat_dirty = true;
+        w.flow_fields.dirty = true;
     }));
 }
 
@@ -1074,6 +1077,346 @@ pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeGzipBas
             },
             Err(_) => std::ptr::null_mut(),
         }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+// =========================================================================
+// 7. v0.2.0 — Fast Topology Clone, O(V) Flow-Fields, Batch Reach & Turbo AI
+// =========================================================================
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeCloneWorldTopology(
+    _env: JNIEnv,
+    _class: JClass,
+    src_handle: jlong,
+) -> jlong {
+    catch_unwind(|| {
+        let Some(h) = (unsafe { handle_ref(src_handle) }) else {
+            return 0;
+        };
+        let w = h.world.read().unwrap_or_else(|e| e.into_inner());
+        let cloned = w.clone_static_topology();
+        drop(w);
+        let boxed = Box::new(WorldHandle {
+            world: RwLock::new(cloned),
+        });
+        Box::into_raw(boxed) as jlong
+    })
+    .unwrap_or(0)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeSyncCombatSnapshot(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    mil_unit_hp: JByteArray,
+    mil_unit_strength: JShortArray,
+    city_hp: JShortArray,
+    city_max_hp: JShortArray,
+    city_strength: JShortArray,
+    tile_def_bonus_pct: JShortArray,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        let mut w = h.world.write().unwrap_or_else(|e| e.into_inner());
+        w.mil_unit_hp = read_u8_vec(&env, &mil_unit_hp);
+        w.mil_unit_strength = read_u16_vec(&env, &mil_unit_strength);
+        w.city_hp = read_u16_vec(&env, &city_hp);
+        w.city_max_hp = read_u16_vec(&env, &city_max_hp);
+        w.city_strength = read_u16_vec(&env, &city_strength);
+        w.tile_def_bonus_pct = read_i16_vec(&env, &tile_def_bonus_pct);
+    }));
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativePatchTileCombat(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    tile: jint,
+    mil_hp: jbyte,
+    mil_str: jshort,
+    city_hp: jshort,
+    city_max_hp: jshort,
+    city_str: jshort,
+    def_bonus_pct: jshort,
+) {
+    let _ = catch_unwind(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        if tile < 0 {
+            return;
+        }
+        let mut w = h.world.write().unwrap_or_else(|e| e.into_inner());
+        w.patch_tile_combat(
+            tile as usize,
+            mil_hp as u8,
+            mil_str as u16,
+            city_hp as u16,
+            city_max_hp as u16,
+            city_str as u16,
+            def_bonus_pct,
+        );
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativePrecomputeCivFlowFields(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    civ_idx: jint,
+    enemy_city_tiles: JIntArray,
+    sieged_city_tiles: JIntArray,
+    own_city_tiles: JIntArray,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        if civ_idx < 0 {
+            return;
+        }
+        let enemy = read_i32_vec(&env, &enemy_city_tiles);
+        let sieged = read_i32_vec(&env, &sieged_city_tiles);
+        let own = read_i32_vec(&env, &own_city_tiles);
+        let mut w = h.world.write().unwrap_or_else(|e| e.into_inner());
+        flowfield::build_civ_flow_fields(&mut w, civ_idx as usize, &enemy, &sieged, &own);
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeQueryFlowNextStep(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    field_kind: jint,
+    from_tile: jint,
+) -> jint {
+    catch_unwind(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return -1;
+        };
+        if from_tile < 0 {
+            return -1;
+        }
+        let w = h.world.read().unwrap_or_else(|e| e.into_inner());
+        flowfield::query_flow_next_step(&w, field_kind, from_tile as usize)
+    })
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeQueryFlowDist(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    field_kind: jint,
+    from_tile: jint,
+) -> jint {
+    catch_unwind(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return u16::MAX as jint;
+        };
+        if from_tile < 0 {
+            return u16::MAX as jint;
+        }
+        let w = h.world.read().unwrap_or_else(|e| e.into_inner());
+        flowfield::query_flow_dist(&w, field_kind, from_tile as usize) as jint
+    })
+    .unwrap_or(u16::MAX as jint)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeGetDangerousTilesInRadius(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    civ_idx: jint,
+    center_tile: jint,
+    radius: jint,
+) -> jni::sys::jintArray {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return empty_int_array(&env);
+        };
+        if civ_idx < 0 || center_tile < 0 {
+            return empty_int_array(&env);
+        }
+        let w = h.world.read().unwrap_or_else(|e| e.into_inner());
+        let res = flowfield::get_dangerous_tiles_in_radius(
+            &w,
+            civ_idx as usize,
+            center_tile as usize,
+            radius,
+        );
+        to_int_array(&env, &res)
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeHasEnoughSettlerRoom(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    city_tiles: JIntArray,
+    min_count: jint,
+) -> jboolean {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return 0;
+        };
+        let cities = read_i32_vec(&env, &city_tiles);
+        let w = h.world.read().unwrap_or_else(|e| e.into_inner());
+        if flowfield::has_enough_settler_room(&w, &cities, min_count) {
+            JNI_TRUE
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(0)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativeBatchCanReach(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    civ_idx: jint,
+    start_tile: jint,
+    flags: jint,
+    current_move_f32: jfloat,
+    current_move_fpm: jint,
+    full_move_fpm: jint,
+    cost_to_embark_fpm: jint,
+    cost_to_disembark_fpm: jint,
+    enemy_penalty_fpm: jint,
+    dm_feature_mask: jlong,
+    dm_base_mask: jlong,
+    dm_hill_mask: jlong,
+    candidates: JIntArray,
+    max_turns: jint,
+) -> jni::sys::jbyteArray {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return env.byte_array_from_slice(&[]).map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut());
+        };
+        if civ_idx < 0 || start_tile < 0 {
+            return env.byte_array_from_slice(&[]).map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut());
+        }
+        let cands = read_i32_vec(&env, &candidates);
+        let profile = UnitProfile {
+            civ_idx: civ_idx as usize,
+            flags: flags as u32,
+            current_move_f32,
+            current_move_fpm,
+            full_move_fpm,
+            cost_to_embark_fpm,
+            cost_to_disembark_fpm,
+            enemy_penalty_fpm,
+            dm_feature_mask: dm_feature_mask as u64,
+            dm_base_mask: dm_base_mask as u64,
+            dm_hill_mask: dm_hill_mask as u64,
+        };
+        let mut w = h.world.write().unwrap_or_else(|e| e.into_inner());
+        let res = pathing::batch_can_reach(&mut w, &profile, start_tile as usize, &cands, max_turns);
+        match env.byte_array_from_slice(&res) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_unciv_nativeengine_UncivRustNative_nativePlanCivCombatUnits(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    civ_idx: jint,
+    start_tiles: JIntArray,
+    hps: JIntArray,
+    attack_strs: JFloatArray,
+    ranged_strs: JFloatArray,
+    ranges: JIntArray,
+    combat_flags: JIntArray,
+    profile_flags: JIntArray,
+    current_move_f32s: JFloatArray,
+    current_move_fpms: JIntArray,
+    full_move_fpms: JIntArray,
+    embark_fpms: JIntArray,
+    disembark_fpms: JIntArray,
+    enemy_penalty_fpms: JIntArray,
+    dm_feature_masks: JLongArray,
+    dm_base_masks: JLongArray,
+    dm_hill_masks: JLongArray,
+) -> jni::sys::jintArray {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return empty_int_array(&env);
+        };
+        if civ_idx < 0 {
+            return empty_int_array(&env);
+        }
+        let tiles = read_i32_vec(&env, &start_tiles);
+        let count = tiles.len();
+        if count == 0 {
+            return empty_int_array(&env);
+        }
+        let hp_v = read_i32_vec(&env, &hps);
+        let astr_v = read_f32_vec(&env, &attack_strs);
+        let rstr_v = read_f32_vec(&env, &ranged_strs);
+        let rng_v = read_i32_vec(&env, &ranges);
+        let cflg_v = read_u32_vec(&env, &combat_flags);
+        let pflg_v = read_u32_vec(&env, &profile_flags);
+        let cmf_v = read_f32_vec(&env, &current_move_f32s);
+        let cmfpm_v = read_i32_vec(&env, &current_move_fpms);
+        let fmfpm_v = read_i32_vec(&env, &full_move_fpms);
+        let emb_v = read_i32_vec(&env, &embark_fpms);
+        let dis_v = read_i32_vec(&env, &disembark_fpms);
+        let epen_v = read_i32_vec(&env, &enemy_penalty_fpms);
+        let dmf_v = read_u64_vec(&env, &dm_feature_masks);
+        let dmb_v = read_u64_vec(&env, &dm_base_masks);
+        let dmh_v = read_u64_vec(&env, &dm_hill_masks);
+
+        let mut units = Vec::with_capacity(count);
+        for i in 0..count {
+            units.push(TurboUnitInput {
+                start_tile: tiles[i].max(0) as usize,
+                hp: hp_v[i],
+                attack_str: astr_v[i],
+                ranged_str: rstr_v[i],
+                range: rng_v[i],
+                combat_flags: cflg_v[i],
+                profile: UnitProfile {
+                    civ_idx: civ_idx as usize,
+                    flags: pflg_v[i],
+                    current_move_f32: cmf_v[i],
+                    current_move_fpm: cmfpm_v[i],
+                    full_move_fpm: fmfpm_v[i],
+                    cost_to_embark_fpm: emb_v[i],
+                    cost_to_disembark_fpm: dis_v[i],
+                    enemy_penalty_fpm: epen_v[i],
+                    dm_feature_mask: dmf_v[i],
+                    dm_base_mask: dmb_v[i],
+                    dm_hill_mask: dmh_v[i],
+                },
+            });
+        }
+
+        let mut w = h.world.write().unwrap_or_else(|e| e.into_inner());
+        let res = turbo_ai::plan_civ_combat_units(&mut w, civ_idx as usize, &units);
+        to_int_array(&env, &res)
     }))
     .unwrap_or(std::ptr::null_mut())
 }

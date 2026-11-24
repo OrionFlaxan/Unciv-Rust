@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag name (e.g. v0.1.0-rust)'
+        description: 'Release tag name (e.g. v0.2.0-rust)'
         required: true
-        default: 'v0.1.0-rust'
+        default: 'v0.2.0-rust'
       prerelease:
         description: 'Mark as pre-release'
         required: false
@@ -110,23 +110,43 @@ jobs:
           fi
 
           cat <<'NOTESEOF' > release-notes.md
-          ## Unciv-Rust Release — Rust Native Simulation Engine
+          ## Unciv-Rust v0.2.0-rust — Multi-Threaded Rayon Engine, O(V) Flow-Fields & Turbo Rust Native AI (Unciv `5.0.2`)
 
-          High-performance Rust-accelerated fork of [Unciv](https://github.com/yairm210/Unciv) designed for smooth **300+ turn Large and Huge maps** on Android and Desktop — with **zero UI changes** and **100% vanilla rules, mods, and save-file compatibility**.
+          High-performance Rust-accelerated fork of [**Unciv**](https://github.com/yairm210/Unciv) synced to upstream **Unciv `5.0.2`** — integrating bounded multi-core **Rayon** parallelism, **O(V) Theater Flow-Fields**, **Turbo Rust Native AI**, zero-allocation **`BattleDamage`**, and **Background Speculative Pre-Turn Warming** while preserving **100% of Unciv's original UI, rules, mods, and save-file compatibility**.
 
           ### Included Downloads
           - **`Unciv-Rust-Android.apk`** — Android 5.0+ (API 21+) universal APK bundling stripped Rust native libraries (`libunciv_native.so`) for all 4 ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`, and `x86`.
           - **`Unciv-Rust-Desktop.jar`** — Desktop executable JAR (`java -jar Unciv-Rust-Desktop.jar`) bundling `linux-x86_64` native acceleration (with transparent pure-Kotlin fallback on other desktop OSes/architectures).
 
-          ### Performance Highlights (Huge Map, 22 AI Civs, 350 Turns)
-          - **Turns 301–325 (Late Game 300+ Turns):** `34.49s/turn` → **`2.86s/turn`** (**12.06× faster**, peak spike `56.44s` → `3.48s`)
-          - **Turns 1–325 Total:** `33.29 min` → **`7.79 min`** (**4.27× overall speedup**)
-          - **Large Map (16 AI Civs, Turns 301–350):** **`1.41s/turn`** mean (**1.36s** median)
-          - **Save/Load Compression:** **2.74× faster save**, **2.75× faster load** (100% cross-compatible with vanilla Unciv saves)
+          ### What's New in `v0.2.0-rust`
+          - **Synced to Upstream Unciv `5.0.2`:** Includes all latest upstream fixes, gameplay improvements, and `View` API updates.
+          - **Bounded Multi-Threaded Rayon Pool + O(V) Parallel Theater Flow-Fields (`flowfield.rs`):** Computes 5 strategic reverse-Dijkstra flow-fields (Land/Water Enemy Cities, Friendly Cities, Sieged Cities, Explore Frontier) once per civ turn across CPU cores.
+          - **Turbo Rust Native AI (`turbo_ai.rs` + Performance Setting Toggle):** 2-phase deterministic parallel combat & movement planner calibrated to Unciv's exact Civ V exponential combat formula, executing real Unciv moves/attacks (`Battle.movePreparingAttack`, `Battle.attackOrNuke`, `moveToTile`). Toggleable in **Options → Display → Performance → Turbo Rust Native AI** (ON by default in single-player; auto-disabled in Online Multiplayer; modded/special units transparently fall back to Kotlin).
+          - **Zero-Allocation `BattleDamage` & Hot-Path Speedups:** Eliminates `Counter<String>` + `.tr()` allocations in AI combat strength math, reuses a single cloned `scratchCity` across all buildings in `ConstructionAutomation`, caches per-civ `validRoadBits`, and batches worker reachability via `nativeBatchCanReach`.
+          - **Background Speculative Pre-Turn Warming (`NativeSpeculativePrewarmer.kt`):** Pre-warms static terrain topology during the human's turn and clones it via ~0.05 ms Rust `memcpy` (`nativeCloneWorldTopology`) when tapping **Next Turn**.
+
+          ### Verified 350-Turn Benchmark Highlights (`OjhBenchmark`, Seed 42)
+          - **Huge Map (22 AI Civs, 4,921 Tiles, ~1,200+ Units):**
+            - **Turns 301–325 Mean:** `34.492s` (Vanilla) → `2.861s` (`v0.1.0-rust`) → **`2.280s`** (**15.13× faster than Vanilla**, **1.60× faster** than Standard Exact `3.657s`)
+            - **Turns 326–350 Mean:** `3.283s` (`v0.1.0-rust`) → **`2.360s`** (**1.61× faster** than Standard Exact `3.804s`)
+            - **Peak Spike Across ALL 350 Turns:** `56.442s` (Vanilla) → `4.127s` (`v0.1.0-rust`) → **`2.973s`** (**zero turns over 3.0s**, **18.98× lower peak spike**!)
+            - **Turns 1–325 Total:** `33.29 min` (Vanilla) → **`6.78 min`** (**4.91× overall speedup**); **Turns 1–350 Total:** **`7.77 min`**
+          - **Large Map (16 AI Civs, 350 Turns):**
+            - **Turns 301–350 Median:** **`0.925s/turn`** *(sub-second median past Turn 300!)* · **Mean:** **`1.031s/turn`** (down from `1.408s` in `v0.1.0-rust`) · **Max:** **`1.466s`**
+            - **Total 350-Turn Time:** **`3.88 min`** (`0.666s/turn` overall)
 
           ### Android Installation Notes
           1. Download **`Unciv-Rust-Android.apk`** on your Android device and tap to install (enable **Install unknown apps** if prompted).
           2. Because this APK uses Unciv's default package ID (`com.unciv.app`) with the debug signing key, back up your saves and uninstall any Google Play / F-Droid copy of Unciv before installing.
+
+          ---
+
+          ### Huge Credits & Attribution
+          All credit for Unciv's game design, Civ V mechanics, LibGDX UI, skins, artwork, tilesets, Civilopedia, modding engine, and translations goes to the upstream open-source **Unciv** project:
+          - **Yair Morgenstern ([`@yairm210`](https://github.com/yairm210))** — Creator and lead developer of [**Unciv**](https://github.com/yairm210/Unciv) ([Google Play](https://play.google.com/store/apps/details?id=com.unciv.app) · [F-Droid](https://f-droid.org/en/packages/com.unciv.app/) · [Discord](https://discord.gg/bjrB4Xw)).
+          - **The 400+ Unciv Open-Source Contributors** — Core developers, UI/UX designers, tileset & unit artists (including CuddlyClover's *Fantasy Hex*, The Noun Project & Freepik icon creators — see [`docs/Credits.md`](https://github.com/OrionFlaxan/Unciv-Rust/blob/master/docs/Credits.md)), and community translators.
+          - **[LibGDX](https://github.com/libgdx/libgdx)**, **[`carlislefox/libgdx-texture-array-batch`](https://github.com/carlislefox/libgdx-texture-array-batch)**, and the Rust crate authors (`rayon`, `jni`, `flate2`/`zlib-rs`, `base64`).
+          - Licensed under the **Mozilla Public License 2.0 (MPL-2.0)**.
           NOTESEOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then

@@ -103,6 +103,37 @@ object UncivRustNative {
     const val CITY_HAS_HARBOR = 1 shl 1
     const val CITY_IS_BLOCKADED = 1 shl 2
 
+    // Flow-field IDs (matches world.rs FLOW_*)
+    const val FLOW_ENEMY_CITY_LAND = 0
+    const val FLOW_ENEMY_CITY_WATER = 1
+    const val FLOW_FRIENDLY_CITY = 2
+    const val FLOW_SIEGED_CITY = 3
+    const val FLOW_EXPLORE_FRONTIER = 4
+    const val FLOW_UNREACHED = 65535
+
+    // Turbo AI output action codes (matches turbo_ai.rs ACTION_*)
+    const val ACTION_FALLBACK_KOTLIN = 0
+    const val ACTION_ATTACK = 1
+    const val ACTION_MOVE = 2
+    const val ACTION_FORTIFY_HEAL = 3
+    const val ACTION_STAY_IDLE = 4
+
+    // Turbo AI unit combat flags (matches turbo_ai.rs TCF_*)
+    const val TCF_IS_MELEE = 1 shl 0
+    const val TCF_IS_RANGED = 1 shl 1
+    const val TCF_IS_SIEGE = 1 shl 2
+    const val TCF_INDIRECT_FIRE = 1 shl 3
+    const val TCF_NO_WOUNDED_PENALTY = 1 shl 4
+    const val TCF_CAN_MOVE_AFTER_ATTACK = 1 shl 5
+    const val TCF_CANNOT_CAPTURE_CITIES = 1 shl 6
+    const val TCF_ATTACK_ACROSS_RIVER = 1 shl 7
+    const val TCF_ATTACK_ACROSS_COAST = 1 shl 8
+    const val TCF_MUST_SETUP = 1 shl 9
+    const val TCF_IS_SETUP = 1 shl 10
+    const val TCF_CAN_FORTIFY = 1 shl 11
+    const val TCF_IS_EMBARKED = 1 shl 12
+    const val TCF_IS_CITY_STATE = 1 shl 13
+
     const val NO_TERRAIN_ID: Byte = -1 // 255 unsigned
 
     // 1. Lifecycle & World Sync
@@ -375,4 +406,100 @@ object UncivRustNative {
 
     @Pure @JvmStatic external fun nativeGzipBase64Encode(input: ByteArray, level: Int): ByteArray
     @Pure @JvmStatic external fun nativeGzipBase64Decode(input: ByteArray): ByteArray?
+
+    // 7. v0.2.0 — Fast Topology Clone, O(V) Flow-Fields, Batch Reach & Turbo AI
+    @Readonly @JvmStatic external fun nativeCloneWorldTopology(srcHandle: Long): Long
+
+    @JvmStatic external fun nativeSyncCombatSnapshot(
+        handle: Long,
+        milUnitHp: ByteArray,
+        milUnitStrength: ShortArray,
+        cityHp: ShortArray,
+        cityMaxHp: ShortArray,
+        cityStrength: ShortArray,
+        tileDefBonusPct: ShortArray
+    )
+
+    @JvmStatic external fun nativePatchTileCombat(
+        handle: Long,
+        tileIdx: Int,
+        milHp: Byte,
+        milStr: Short,
+        cityHp: Short,
+        cityMaxHp: Short,
+        cityStr: Short,
+        defBonusPct: Short
+    )
+
+    @JvmStatic external fun nativePrecomputeCivFlowFields(
+        handle: Long,
+        civIdx: Int,
+        enemyCityTiles: IntArray,
+        siegedCityTiles: IntArray,
+        ownCityTiles: IntArray
+    )
+
+    @Readonly @JvmStatic external fun nativeQueryFlowNextStep(
+        handle: Long,
+        fieldKind: Int,
+        fromTile: Int
+    ): Int
+
+    @Readonly @JvmStatic external fun nativeQueryFlowDist(
+        handle: Long,
+        fieldKind: Int,
+        fromTile: Int
+    ): Int
+
+    @Readonly @JvmStatic external fun nativeGetDangerousTilesInRadius(
+        handle: Long,
+        civIdx: Int,
+        centerTile: Int,
+        radius: Int
+    ): IntArray
+
+    @Readonly @JvmStatic external fun nativeHasEnoughSettlerRoom(
+        handle: Long,
+        cityTiles: IntArray,
+        minCount: Int
+    ): Boolean
+
+    @Readonly @JvmStatic external fun nativeBatchCanReach(
+        handle: Long,
+        civIdx: Int,
+        startTile: Int,
+        flags: Int,
+        currentMoveF32: Float,
+        currentMoveFpm: Int,
+        fullMoveFpm: Int,
+        costToEmbarkFpm: Int,
+        costToDisembarkFpm: Int,
+        enemyPenaltyFpm: Int,
+        dmFeatureMask: Long,
+        dmBaseMask: Long,
+        dmHillMask: Long,
+        candidates: IntArray,
+        maxTurns: Int
+    ): ByteArray
+
+    @Readonly @JvmStatic external fun nativePlanCivCombatUnits(
+        handle: Long,
+        civIdx: Int,
+        startTiles: IntArray,
+        hps: IntArray,
+        attackStrs: FloatArray,
+        rangedStrs: FloatArray,
+        ranges: IntArray,
+        combatFlags: IntArray,
+        profileFlags: IntArray,
+        currentMoveF32s: FloatArray,
+        currentMoveFpms: IntArray,
+        fullMoveFpms: IntArray,
+        embarkFpms: IntArray,
+        disembarkFpms: IntArray,
+        enemyPenaltyFpms: IntArray,
+        dmFeatureMasks: LongArray,
+        dmBaseMasks: LongArray,
+        dmHillMasks: LongArray
+    ): IntArray
 }

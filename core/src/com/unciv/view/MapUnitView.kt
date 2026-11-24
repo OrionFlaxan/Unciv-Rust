@@ -77,6 +77,8 @@ class MapUnitView internal constructor(
         return true
     }
     @Readonly fun getAvailablePromotions(): List<AvailablePromotion> = unit.promotions.getPromotionTreeCandidates()
+    val numberOfPromotions: Int get() = unit.promotions.numberOfPromotions
+    @Readonly fun canIntercept(): Boolean = unit.canIntercept()
     @Readonly fun canAffordPromotions(count: Int): Boolean = unit.promotions.canAffordPromotions(count)
     /** `true` if this unit stands in a non-puppet city of its own civ, so its promotions can be saved as the city's default. */
     @Readonly fun canSaveDefaultPromotions(): Boolean {
@@ -129,6 +131,12 @@ class MapUnitView internal constructor(
         val out = ArrayList<TileView>(path.size)
         for (t in path) out.add(tmv.getTile(t))
         return idx to out
+    }
+    @Readonly fun batchCanReach(candidates: List<TileView>): BooleanArray {
+        if (candidates.isEmpty()) return BooleanArray(0)
+        val unwrapped = ArrayList<com.unciv.logic.map.tile.Tile>(candidates.size)
+        for (c in candidates) unwrapped.add(c.unwrap())
+        return unit.movement.batchCanReach(unwrapped)
     }
     @Readonly fun canSwapTo(tileView: TileView): Boolean = unit.movement.canUnitSwapTo(tileView.unwrap())
     // All "prepare and then choose tile" logic is actually UI stuff, and should be migrated out of logic layer
@@ -256,9 +264,10 @@ class MapUnitView internal constructor(
         AirInterception.airSweep(MapUnitCombatant(unit), targetTileView.unwrap())
         return true
     }
-    /** `true` if [tryInvokeUnitAction] would currently find an enabled action of type [unitActionType] */
-    fun canInvokeUnitAction(unitActionType: UnitActionType): Boolean =
-        UnitActions.getUnitActions(unit, unitActionType).any { it.action != null }
+    /** `true` if [tryInvokeUnitAction] would currently find an enabled action of type [unitActionType]
+     *  @param tile Check as if the unit were performing the action on this tile (defaults to the unit's current tile) - not all action types respect it */
+    fun canInvokeUnitAction(unitActionType: UnitActionType, tile: TileView? = null): Boolean =
+        UnitActions.getUnitActions(unit, unitActionType, tile?.unwrap() ?: unit.getTile()).any { it.action != null }
     /** The actions this unit has, enabled or not (see [UnitActionView.available]) - pass them to [tryInvokeUnitAction] to invoke them */
     fun getActions(): List<UnitActionView> =
         UnitActions.getUnitActions(unit).map { UnitActionView(it.type, it.id, it.action != null, it.title, it.isCurrentAction, it.confirmation,

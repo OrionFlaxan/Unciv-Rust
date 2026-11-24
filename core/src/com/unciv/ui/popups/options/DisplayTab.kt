@@ -113,6 +113,15 @@ internal class DisplayTab(
         disableNewerRenderingLabel.wrap = true
         add(disableNewerRenderingLabel).colspan(2).padTop(10f).row()
 
+        addCheckbox("Turbo Rust Native AI (Faster Late-Game Turns)", settings::turboRustAi)
+        val turboRustAiDescription = "Accelerates AI combat and movement planning with multi-threaded Rust flow-fields in single-player (auto-disabled in online multiplayer; modded units fall back safely)"
+        val turboRustAiLabel = WrappableLabel(
+            turboRustAiDescription,
+            optionsPopup.tabs.prefWidth, Color.ORANGE.brighten(0.7f), 14
+        )
+        turboRustAiLabel.wrap = true
+        add(turboRustAiLabel).colspan(2).padTop(10f).row()
+
         addHeader("Experimental")
 
         addCheckbox("Animate Unit movement button", settings::unitMovementButtonAnimation)

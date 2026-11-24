@@ -430,6 +430,20 @@ pub fn compute_distance_within_turn(
     if (p.flags & UP_CONSIDER_ZOC) != 0 && (p.flags & UP_IGNORES_ZOC) == 0 {
         world.ensure_zoc(p.civ_idx);
     }
+    compute_distance_within_turn_ro(world, p, start_tile, include_unpassable_boundary)
+}
+
+/// Lock-free read-only single-turn reachability query (caller must have ensured ZoC for `p.civ_idx`).
+/// Safe to invoke concurrently across all CPU cores via `rayon::par_iter()`.
+pub fn compute_distance_within_turn_ro(
+    world: &NativeWorld,
+    p: &UnitProfile,
+    start_tile: usize,
+    include_unpassable_boundary: bool,
+) -> Vec<i32> {
+    if start_tile >= world.num_tiles {
+        return Vec::new();
+    }
 
     let usable = p.current_move_f32;
     if usable == 0.0 || (!include_unpassable_boundary && usable <= 0.0) || (p.flags & UP_CANNOT_MOVE) != 0 {
@@ -1335,6 +1349,212 @@ pub fn batch_first_reachable(
             (-1, Vec::new())
         }
     })
+}
+
+/// Single-expansion reachability check for multiple target tiles simultaneously!
+/// Replaces K separate `canReach(tile)` A* calls inside `WorkerAutomation.findTileToWork`
+/// with ONE shared Dijkstra expansion that stops early once all reachable targets are found.
+pub fn batch_can_reach(
+    world: &mut NativeWorld,
+    p: &UnitProfile,
+    start_tile: usize,
+    candidates: &[i32],
+    max_turns: i32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; candidates.len()];
+    if candidates.is_empty() || start_tile >= world.num_tiles || (p.flags & UP_CANNOT_MOVE) != 0 {
+        return out;
+    }
+    if p.current_move_fpm <= 0 || p.full_move_fpm <= 0 {
+        for (i, &c) in candidates.iter().enumerate() {
+            if c as usize == start_tile {
+                out[i] = 1;
+            }
+        }
+        return out;
+    }
+
+    if (p.flags & UP_CONSIDER_ZOC) != 0 && (p.flags & UP_IGNORES_ZOC) == 0 {
+        world.ensure_zoc(p.civ_idx);
+    }
+
+    let time_limit = max_turns.clamp(1, MAX_TURNS - 1);
+    let full_move = p.full_move_fpm.min(MAX_MOVE_THIS_TURN_FPM);
+    let move_used_init = (full_move - p.current_move_fpm).clamp(0, MAX_MOVE_THIS_TURN_FPM);
+    let civ = p.civ_idx;
+    let assume_unexplored = (p.flags & UP_ASSUME_UNEXPLORED_PASSABLE) != 0;
+    let avoid_enemy_civ = (p.flags & UP_AVOID_ENEMY_TERRITORY) != 0;
+    let allow_unpassable_dest = (p.flags & UP_ALLOW_UNPASSABLE_DEST) != 0;
+
+    with_scratch(|sc| {
+        let mgen = sc.next_mark(world.num_tiles);
+        let mut remaining_targets = 0usize;
+        for (i, &c) in candidates.iter().enumerate() {
+            if c < 0 || c as usize >= world.num_tiles {
+                continue;
+            }
+            let cu = c as usize;
+            if cu == start_tile {
+                out[i] = 1;
+                continue;
+            }
+            if quick_unreachable_check(world, p, start_tile, cu) {
+                continue;
+            }
+            if sc.mark[cu] != mgen {
+                sc.mark[cu] = mgen;
+                remaining_targets += 1;
+            }
+        }
+        if remaining_targets == 0 {
+            return;
+        }
+
+        let gen = sc.next_gen(world.num_tiles);
+        let root = pack_route_node(
+            start_tile,
+            DIPLO_REL_FAVORABLE,
+            0,
+            move_used_init,
+            0,
+            false,
+            0,
+        );
+        sc.seen_gen[start_tile] = gen;
+        sc.route_nodes[start_tile] = root;
+        sc.route_parent[start_tile] = start_tile as i32;
+        let est0 = calc_underestimated(world, civ, root, full_move, None);
+        sc.heap_push(pack_prioritized(root, est0));
+        sc.todo_gen[start_tile] = gen;
+        sc.todo_dmg[start_tile] = 0;
+
+        while let Some(packed) = sc.heap_pop() {
+            let u = rn_tile(packed);
+            let cur_node = sc.route_nodes[u];
+            if (packed & !UNDEREST_HI_MASK) != (cur_node & !UNDEREST_HI_MASK) {
+                continue;
+            }
+            if sc.closed_gen[u] == gen && sc.todo_gen[u] != gen {
+                continue;
+            }
+            sc.todo_gen[u] = 0;
+            sc.closed_gen[u] = gen;
+
+            let nt_u = rn_turns(cur_node);
+            let nu_u = rn_move_this_turn(cur_node);
+            if !(nt_u < time_limit - 1 || (nt_u == time_limit - 1 && nu_u < full_move)) {
+                continue;
+            }
+
+            let cur_dmg = rn_damaging_tiles(cur_node);
+            let base = u * 6;
+            for d in 0..6 {
+                let nb = world.neighbors[base + d];
+                if nb < 0 {
+                    continue;
+                }
+                let v = nb as usize;
+                if sc.closed_gen[v] == gen && rn_damaging_tiles(sc.route_nodes[v]) <= cur_dmg {
+                    continue;
+                }
+                if avoid_enemy_civ {
+                    let owner = world.owner_civ[v];
+                    if owner >= 0 && world.is_at_war(civ, owner as usize) {
+                        continue;
+                    }
+                }
+
+                let is_cand = sc.mark[v] == mgen;
+                let explored = world.is_explored(civ, v);
+                if !assume_unexplored && !explored {
+                    continue;
+                }
+                let passable = (assume_unexplored && !explored) || can_pass_through(world, p, v);
+                let is_unpassable_dest = !passable && allow_unpassable_dest && is_cand;
+                if !passable && !is_unpassable_dest {
+                    sc.closed_gen[v] = gen;
+                    sc.seen_gen[v] = gen;
+                    sc.route_nodes[v] = pack_route_node(v, 0, MAX_MOVE_THIS_TURN_FPM, MAX_MOVE_THIS_TURN_FPM, MAX_TURNS, false, MAX_DAMAGING_TILES);
+                    continue;
+                }
+
+                let Some(new_node) = calculate_neighbor_node(
+                    world,
+                    p,
+                    sc,
+                    cur_node,
+                    u,
+                    v,
+                    d,
+                    full_move,
+                    is_unpassable_dest,
+                ) else {
+                    continue;
+                };
+
+                if sc.seen_gen[v] == gen && new_node >= sc.route_nodes[v] {
+                    continue;
+                }
+
+                let first_seen = sc.seen_gen[v] != gen;
+                sc.seen_gen[v] = gen;
+                sc.route_nodes[v] = new_node;
+                sc.route_parent[v] = u as i32;
+
+                if is_cand && first_seen {
+                    let can_stop = is_unpassable_dest || can_move_to_assuming_pass_through(world, p, v);
+                    if can_stop {
+                        remaining_targets = remaining_targets.saturating_sub(1);
+                        if remaining_targets == 0 {
+                            break;
+                        }
+                    }
+                }
+
+                if is_unpassable_dest {
+                    sc.closed_gen[v] = gen;
+                    continue;
+                }
+
+                let nt = rn_turns(new_node);
+                let nu = rn_move_this_turn(new_node);
+                if nt < time_limit - 1 || (nt == time_limit - 1 && nu < full_move) {
+                    let est = calc_underestimated(world, civ, new_node, full_move, None);
+                    sc.heap_push(pack_prioritized(new_node, est));
+                    sc.todo_gen[v] = gen;
+                    sc.todo_dmg[v] = rn_damaging_tiles(new_node) as u8;
+                }
+            }
+            if remaining_targets == 0 {
+                break;
+            }
+        }
+
+        for (i, &c) in candidates.iter().enumerate() {
+            if out[i] == 1 || c < 0 || c as usize >= world.num_tiles {
+                continue;
+            }
+            let cu = c as usize;
+            if sc.seen_gen[cu] == gen {
+                let enemy_blocked = avoid_enemy_civ && {
+                    let owner = world.owner_civ[cu];
+                    owner >= 0 && world.is_at_war(civ, owner as usize)
+                };
+                if enemy_blocked {
+                    continue;
+                }
+                let explored = world.is_explored(civ, cu);
+                let passable = (assume_unexplored && !explored) || can_pass_through(world, p, cu);
+                if (passable && can_move_to_assuming_pass_through(world, p, cu))
+                    || (!passable && allow_unpassable_dest)
+                {
+                    out[i] = 1;
+                }
+            }
+        }
+    });
+
+    out
 }
 
 #[cfg(test)]
