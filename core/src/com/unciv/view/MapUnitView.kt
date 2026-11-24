@@ -132,6 +132,12 @@ class MapUnitView internal constructor(
         for (t in path) out.add(tmv.getTile(t))
         return idx to out
     }
+    @Readonly fun batchCanReach(candidates: List<TileView>): BooleanArray {
+        if (candidates.isEmpty()) return BooleanArray(0)
+        val unwrapped = ArrayList<com.unciv.logic.map.tile.Tile>(candidates.size)
+        for (c in candidates) unwrapped.add(c.unwrap())
+        return unit.movement.batchCanReach(unwrapped)
+    }
     @Readonly fun canSwapTo(tileView: TileView): Boolean = unit.movement.canUnitSwapTo(tileView.unwrap())
     // All "prepare and then choose tile" logic is actually UI stuff, and should be migrated out of logic layer
     @Readonly fun canMoveTo(tileView: TileView): Boolean = unit.movement.canMoveTo(tileView.unwrap())

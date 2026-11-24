@@ -22,6 +22,13 @@ object HeadTowardsEnemyCityAutomation {
         // only focus on *attacking* 1 enemy at a time otherwise you'll lose on both fronts
         val enemyCities = getEnemyCitiesByPriority(unitView).toList()
         if (enemyCities.isEmpty()) return false
+
+        // O(1) Rust O(V) Theater Flow-Field fast path when far from the target city (>6 hexes):
+        // Avoids per-unit multi-turn A* across the continent; falls back transparently if obstructed.
+        if (tryFollowFlowField(unitView, com.unciv.nativeengine.UncivRustNative.FLOW_ENEMY_CITY_LAND, minFlowDist = 12)) {
+            return true
+        }
+
         val cityTiles = ArrayList<TileView>(enemyCities.size)
         for (c in enemyCities) cityTiles.add(c.getCenterTile())
         val (bestIdx, shortestPath) = unitView.batchFirstReachable(cityTiles)
@@ -35,6 +42,37 @@ object HeadTowardsEnemyCityAutomation {
     }
 
     /**
+     * Walks up to `maxMovement` steps along a precomputed Rust theater flow-field in O(1) per step.
+     * Returns `true` if the unit successfully moved closer along an unobstructed flow-field route.
+     */
+    private fun tryFollowFlowField(unitView: MapUnitView, fieldKind: Int, minFlowDist: Int): Boolean {
+        val civ = unitView.civ()
+        val startTile = unitView.getTile()
+        val curDist = civ.queryFlowDistNative(fieldKind, startTile) ?: return false
+        if (curDist >= com.unciv.nativeengine.UncivRustNative.FLOW_UNREACHED || curDist <= minFlowDist) return false
+        if (unitView.getRange() > 2 && fieldKind == com.unciv.nativeengine.UncivRustNative.FLOW_ENEMY_CITY_LAND) return false
+
+        val maxSteps = unitView.getMaxMovement().toInt().coerceIn(1, 5)
+        var cursor = startTile
+        var bestStep: TileView? = null
+        for (s in 0 until maxSteps) {
+            val nxt = civ.queryFlowNextStepNative(fieldKind, cursor) ?: break
+            if (nxt == cursor || nxt == startTile) break
+            if (unitView.getDamageFromTerrain(nxt) > 0) break
+            if (!unitView.canReachInCurrentTurn(nxt)) break
+            cursor = nxt
+            if (unitView.canMoveTo(nxt)) {
+                bestStep = nxt
+            }
+            val nd = civ.queryFlowDistNative(fieldKind, nxt) ?: break
+            if (nd <= minFlowDist - 2) break
+        }
+        val target = bestStep ?: return false
+        unitView.tryMoveToTile(target)
+        return true
+    }
+
+    /**
      * Naval AI: steam toward the nearest water tile from which we can attack an enemy city or military unit.
      * Picks cities and units by aerial distance so nearer fleets/cities win over distant capitals.
      * Station selection uses canMoveTo/canReach, so coastal-only ships never path through ocean they cannot enter.
@@ -44,6 +82,13 @@ object HeadTowardsEnemyCityAutomation {
 
         val waterOnlyAttacks = unitView.getMatchingUniques(UniqueType.CanOnlyAttackTiles)
             .any { it.params[0] == "Water" }
+
+        // O(1) Rust Naval Theater Flow-Field fast path for distant fleets steaming toward enemy coastal cities
+        if (!waterOnlyAttacks
+            && tryFollowFlowField(unitView, com.unciv.nativeengine.UncivRustNative.FLOW_ENEMY_CITY_WATER, minFlowDist = 8)
+        ) {
+            return true
+        }
 
         var bestDest: TileView? = null
         var bestAerial = Int.MAX_VALUE

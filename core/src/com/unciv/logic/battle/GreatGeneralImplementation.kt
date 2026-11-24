@@ -57,4 +57,49 @@ object GreatGeneralImplementation {
             return Pair(greatGeneralModifier.general.name, greatGeneralModifier.bonus * 2)
         return Pair(greatGeneralModifier.general.name, greatGeneralModifier.bonus)
     }
+
+    /**
+     * Zero-allocation numeric fast path equivalent to [getGreatGeneralBonus]`.second`,
+     * used by [BattleDamage.getGeneralModifierSum] to avoid intermediate Sequence/Pair allocations.
+     */
+    @Readonly
+    fun getGreatGeneralBonusInt(
+        ourUnitCombatant: MapUnitCombatant,
+        enemy: ICombatant,
+        combatAction: CombatAction
+    ): Int {
+        val unit = ourUnitCombatant.unit
+        val civInfo = unit.civ
+        val unitTile = unit.getTile()
+        var bestBonus = Int.MIN_VALUE
+        var bestGeneral: MapUnit? = null
+        var ctx: GameContext? = null
+
+        for (general in civInfo.units.getCivUnits()) {
+            if (!general.cache.hasStrengthBonusInRadiusUnique) continue
+            val gameContext = ctx ?: GameContext(
+                civInfo,
+                ourCombatant = ourUnitCombatant,
+                theirCombatant = enemy,
+                combatAction = combatAction
+            ).also { ctx = it }
+            val dist = general.currentTile.aerialDistanceTo(unitTile)
+            for (unique in general.getMatchingUniques(UniqueType.StrengthBonusInRadius, gameContext)) {
+                val radius = unique.params[2].toIntOrNull() ?: 0
+                if (dist > radius) continue
+                val filter = unique.params[1]
+                if (filter != "Military" && !unit.matchesFilter(filter, state = general.cache.state)) continue
+                val bonus = unique.params[0].toIntOrNull() ?: 0
+                if (bonus > bestBonus) {
+                    bestBonus = bonus
+                    bestGeneral = general
+                }
+            }
+        }
+        val chosen = bestGeneral ?: return 0
+        if (unit.hasUnique(UniqueType.GreatGeneralProvidesDoubleCombatBonus, checkCivInfoUniques = true)
+            && chosen.isGreatPersonOfType("War")
+        ) return bestBonus * 2
+        return bestBonus
+    }
 }

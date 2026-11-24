@@ -424,8 +424,9 @@ object NextTurnAutomation {
     private fun automateUnits(civView: CivView, cache: AutomationCache) {
         val civInfo = civView.getCiv()
         val isAtWar = civView.isAtWar()
-        // Pre-sync native world & build multi-source threat field once for this civ's turn
-        civInfo.gameInfo.tileMap.getOrCreateNativeWorld()?.ensureThreatField(civInfo)
+        val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+        // Pre-sync native world & build multi-source threat field once for priority sorting & civilian safety
+        mirror?.ensureThreatField(civInfo)
 
         // Instances present when the pass starts. addUnit/removeUnit replace UnitManager's list,
         // so units acquired later must not extend this pass. The instances stay mutable:
@@ -467,12 +468,224 @@ object NextTurnAutomation {
         } else {
             initialSorted
         }
+
+        // Run Civilians, Air units, and Nukes first in priority order so any state transitions
+        // (unit gifting, air sweeps/strikes, captures, worker moves) settle before military batch planning.
+        val preHandled = HashSet<MapUnit>()
+        var remainingMilitaryCount = 0
+        for (unit in finalOrder) {
+            if (unit.hasUnique(UniqueType.SpaceshipPart) || unit.hasUnique(UniqueType.FoundCity)) continue
+            if (unit.isCivilian() || unit.isAirUnit() || unit.isNuclearWeapon()) {
+                if (!isStillOurUnit(unit, civView)) continue
+                if (unit.getBaseUnit().isGreatPersonOfType("War")) continue // Great Generals move after military units
+                UnitAutomation.automateUnitMoves(unit, cache)
+                preHandled.add(unit.getUnit())
+            } else {
+                remainingMilitaryCount++
+            }
+        }
+
+        // Build O(V) theater flow-fields ONCE for military units (after civilians/workers/cityConquer have finished!)
+        if (mirror != null && remainingMilitaryCount > 0) {
+            precomputeCivFlowFieldsForTurn(civView, civInfo, isAtWar, cache, mirror)
+        }
+
+        // Turbo Rust Native AI: parallel Rayon 2-phase batch combat & movement planner for eligible military units
+        val turboHandled = if (mirror != null && isTurboRustAiActive(civInfo)) {
+            executeTurboRustCombatBatch(civView, civInfo, finalOrder, mirror)
+        } else {
+            null
+        }
+
         for (unit in finalOrder) {
             // spaceship parts and settlers have already moved
             if (unit.hasUnique(UniqueType.SpaceshipPart) || unit.hasUnique(UniqueType.FoundCity)) continue
+            val rawUnit = unit.getUnit()
+            if (rawUnit in preHandled) continue
+            if (turboHandled != null && rawUnit in turboHandled) continue
             if (!isStillOurUnit(unit, civView)) continue
             UnitAutomation.automateUnitMoves(unit, cache)
         }
+    }
+
+    private fun isTurboRustAiActive(civInfo: Civilization): Boolean {
+        if (civInfo.gameInfo.gameParameters.isOnlineMultiplayer) return false
+        val overrideProp = System.getProperty("unciv.turboRustAi")
+        if (overrideProp != null) return overrideProp.equals("true", ignoreCase = true)
+        return if (UncivGame.isCurrentInitialized()) {
+            UncivGame.Current.settings.isTurboRustAiEnabled(false)
+        } else {
+            true
+        }
+    }
+
+    private fun precomputeCivFlowFieldsForTurn(
+        civView: CivView,
+        civInfo: Civilization,
+        isAtWar: Boolean,
+        cache: AutomationCache,
+        mirror: com.unciv.nativeengine.NativeWorldMirror
+    ) {
+        val ownCityTiles = ArrayList<Tile>(civInfo.cities.size)
+        val siegedCityTiles = ArrayList<Tile>()
+        for (city in civInfo.cities) {
+            val ct = city.getCenterTile()
+            ownCityTiles.add(ct)
+            if (city.health < city.getMaxHealth()) siegedCityTiles.add(ct)
+        }
+
+        val enemySeedTiles = ArrayList<Tile>()
+        if (isAtWar) {
+            val capitalTile = civInfo.getCapital()?.getCenterTile()
+            var closestEnemyCity: City? = null
+            var closestDist = Int.MAX_VALUE
+            for (other in civInfo.getKnownCivs()) {
+                if (!civInfo.isAtWarWith(other) || other.cities.isEmpty()) continue
+                if (capitalTile == null) {
+                    for (ec in other.cities) enemySeedTiles.add(ec.getCenterTile())
+                } else {
+                    for (ec in other.cities) {
+                        val d = ec.getCenterTile().aerialDistanceTo(capitalTile)
+                        if (d < closestDist) {
+                            closestDist = d
+                            closestEnemyCity = ec
+                        }
+                    }
+                }
+            }
+            if (closestEnemyCity != null) {
+                val targetCenter = closestEnemyCity.getCenterTile()
+                for (ec in closestEnemyCity.civ.cities) {
+                    val ct = ec.getCenterTile()
+                    if (ct.aerialDistanceTo(targetCenter) <= 10) {
+                        enemySeedTiles.add(ct)
+                    }
+                }
+            }
+        } else {
+            // In peacetime, steer idle military flow-field toward known barbarian encampments near our cities
+            val tileMap = civInfo.gameInfo.tileMap
+            for (camp in cache.getKnownEncampmentsNearCities(civView)) {
+                enemySeedTiles.add(tileMap[camp.position()])
+            }
+        }
+
+        mirror.precomputeCivFlowFields(civInfo, enemySeedTiles, siegedCityTiles, ownCityTiles)
+        cache.flowFieldsBuiltForCiv = true
+    }
+
+    /**
+     * Runs Rust's multi-threaded 2-phase combat & movement planner for all eligible standard combat
+     * units in ONE batch JNI call, then executes real Unciv actions (`Battle.movePreparingAttack`,
+     * `Battle.attackOrNuke`, `unit.movement.moveToTile`, `unit.fortifyIfCan`) so all rules, XP,
+     * promotions, captures, and uniques fire authentically.
+     *
+     * Any ineligible/modded/unhandled unit is omitted from the returned set and runs normal Kotlin
+     * [UnitAutomation.automateUnitMoves].
+     */
+    private fun executeTurboRustCombatBatch(
+        civView: CivView,
+        civInfo: Civilization,
+        orderedUnits: List<MapUnitView>,
+        mirror: com.unciv.nativeengine.NativeWorldMirror
+    ): HashSet<MapUnit>? {
+        val eligibleViews = ArrayList<MapUnitView>(orderedUnits.size)
+        val eligibleUnits = ArrayList<MapUnit>(orderedUnits.size)
+
+        for (uv in orderedUnits) {
+            if (uv.hasUnique(UniqueType.SpaceshipPart) || uv.hasUnique(UniqueType.FoundCity)) continue
+            if (!isStillOurUnit(uv, civView)) continue
+            val u = uv.getUnit()
+            if (mirror.isUnitEligibleForTurboAi(u)) {
+                eligibleViews.add(uv)
+                eligibleUnits.add(u)
+            }
+        }
+        if (eligibleUnits.isEmpty()) return null
+
+        val packed = mirror.planCivCombatUnits(civInfo, eligibleUnits)
+        if (packed.size < eligibleUnits.size * 3) return null
+
+        val tiles = civInfo.gameInfo.tileMap.tileList
+        val numTiles = tiles.size
+        val handled = HashSet<MapUnit>(eligibleUnits.size * 2)
+
+        for (i in 0 until eligibleUnits.size) {
+            val unitView = eligibleViews[i]
+            val unit = eligibleUnits[i]
+            if (!isStillOurUnit(unitView, civView) || !unit.hasMovement()) {
+                handled.add(unit)
+                continue
+            }
+
+            val base = i * 3
+            val action = packed[base]
+            val moveIdx = packed[base + 1]
+            val atkIdx = packed[base + 2]
+
+            when (action) {
+                com.unciv.nativeengine.UncivRustNative.ACTION_ATTACK -> {
+                    if (moveIdx in 0 until numTiles && atkIdx in 0 until numTiles) {
+                        val fromTile = tiles[moveIdx]
+                        val targetTile = tiles[atkIdx]
+                        val combatant = MapUnitCombatant(unit)
+                        val enemyCombatant = Battle.getMapCombatantOfTile(targetTile)
+                        val canStand = fromTile == unit.currentTile ||
+                            (unit.movement.canMoveTo(fromTile) && unit.movement.canReachInCurrentTurn(fromTile))
+                        if (enemyCombatant != null && canStand && TargetHelper.containsAttackableEnemy(targetTile, combatant)) {
+                            val moveLeft = if (fromTile == unit.currentTile) {
+                                unit.currentMovement
+                            } else {
+                                val distInfo = unit.movement.getDistanceToTiles()[fromTile]
+                                if (distInfo != null) (unit.currentMovement - distInfo.totalMovement).coerceAtLeast(0f) else 0f
+                            }
+                            val attackable = AttackableTile(fromTile, targetTile, moveLeft, enemyCombatant)
+                            val prevTile = unit.currentTile
+                            if (Battle.movePreparingAttack(combatant, attackable, tryHealPillage = true)) {
+                                Battle.attackOrNuke(combatant, attackable)
+                                mirror.patchTileCombat(prevTile)
+                                if (!unit.isDestroyed && unit.hasTile()) mirror.patchTileCombat(unit.currentTile)
+                                mirror.patchTileCombat(targetTile)
+                                handled.add(unit)
+                            }
+                        }
+                    }
+                }
+                com.unciv.nativeengine.UncivRustNative.ACTION_MOVE -> {
+                    if (moveIdx in 0 until numTiles) {
+                        val destTile = tiles[moveIdx]
+                        if (destTile != unit.currentTile
+                            && unit.movement.canMoveTo(destTile)
+                            && unit.movement.canReachInCurrentTurn(destTile)
+                        ) {
+                            val prevTile = unit.currentTile
+                            unit.movement.moveToTile(destTile)
+                            mirror.patchTileCombat(prevTile)
+                            if (!unit.isDestroyed && unit.hasTile()) {
+                                mirror.patchTileCombat(unit.currentTile)
+                                // Opportunistic attack if moving uncovered a target in range
+                                if (unit.hasMovement()
+                                    && unit.attacksThisTurn < unit.maxAttacksPerTurn()
+                                    && mirror.getDistanceToClosestEnemy(civInfo, unit.currentTile, unit.getRange().coerceAtLeast(1), false) <= unit.getRange().coerceAtLeast(1)
+                                ) {
+                                    com.unciv.logic.automation.unit.BattleHelper.tryAttackNearbyEnemy(unitView, stayOnTile = true)
+                                }
+                            }
+                            handled.add(unit)
+                        }
+                    }
+                }
+                com.unciv.nativeengine.UncivRustNative.ACTION_FORTIFY_HEAL -> {
+                    unit.fortifyIfCan()
+                    handled.add(unit)
+                }
+                com.unciv.nativeengine.UncivRustNative.ACTION_STAY_IDLE -> {
+                    handled.add(unit)
+                }
+                // ACTION_FALLBACK_KOTLIN (0) or unexpected value -> fall through to UnitAutomation.automateUnitMoves
+            }
+        }
+        return handled
     }
 
     private fun sortUnitsByPriority(units: List<MapUnitView>, isAtWar: Boolean, cache: AutomationCache): List<MapUnitView> {
@@ -658,12 +871,19 @@ object NextTurnAutomation {
         if (CivilianUnitAutomation.isLateGame(civView)){
             // all suitable land may be occupied already
             // 10 tiles away and 6 "options" are heuristics based on nothing, feel free to change 
-            var unoccupiedNearishTiles = 0
-            for (city in civInfo.cities)
-                city.getCenterTile().forEachTileInDistance(10) {
-                    if (it.owningCity == null && it.neighbors.all { neighbor -> neighbor.owningCity == null }) unoccupiedNearishTiles++
-                }
-            if (unoccupiedNearishTiles < 6) return
+            val mirror = civInfo.gameInfo.tileMap.getOrCreateNativeWorld()
+            if (mirror != null) {
+                val cityTiles = ArrayList<Tile>(civInfo.cities.size)
+                for (city in civInfo.cities) cityTiles.add(city.getCenterTile())
+                if (!mirror.hasEnoughSettlerRoom(civInfo.gameInfo, cityTiles, 6)) return
+            } else {
+                var unoccupiedNearishTiles = 0
+                for (city in civInfo.cities)
+                    city.getCenterTile().forEachTileInDistance(10) {
+                        if (it.owningCity == null && it.neighbors.all { neighbor -> neighbor.owningCity == null }) unoccupiedNearishTiles++
+                    }
+                if (unoccupiedNearishTiles < 6) return
+            }
         } 
 
         // This is a tough one - if we don't ignore conditionals we could have units that can found only on certain tiles that are ignored

@@ -263,9 +263,14 @@ class WorldScreen(
         // don't run update() directly, because the UncivGame.worldScreen should be set so that the city buttons and tile groups
         //  know what the viewing civ is.
         shouldUpdate = true
+
+        if (isPlayersTurn && !gameInfo.gameParameters.isOnlineMultiplayer) {
+            com.unciv.nativeengine.NativeSpeculativePrewarmer.scheduleWarmup(gameInfo)
+        }
     }
 
     override fun dispose() {
+        com.unciv.nativeengine.NativeSpeculativePrewarmer.cancelPending()
         resizeDeferTimer?.cancel()
         events.stopReceiving()
         statusButtons.dispose()
@@ -599,6 +604,7 @@ class WorldScreen(
             val originalGameInfo = gameInfo
             val gameInfoClone = originalGameInfo.clone()
             gameInfoClone.setTransients()  // this can get expensive on large games, not the clone itself
+            com.unciv.nativeengine.NativeSpeculativePrewarmer.handoffTopologyToClone(originalGameInfo, gameInfoClone)
 
             progressBar.increment()
 

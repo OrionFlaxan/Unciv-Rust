@@ -103,12 +103,22 @@ object BattleHelper {
         if (city.getHealth() == 1)
             return if (canCaptureCity) 10000 // Capture the city immediately!
             else 0 // No reason to attack, we won't make any difference
-        
-        if (canCaptureCity && city.getHealth() <= attackerUnit.calculateDamageToDefender(cityUnit).coerceAtLeast(1))
-            return 10000
-            
 
-        if (attacker.getBaseUnit().isMelee()) {
+        val isMelee = attacker.getBaseUnit().isMelee()
+        if (canCaptureCity) {
+            val (battleDamage, dmgToCity) = attackerUnit.calculateBothDamages(cityUnit)
+            if (city.getHealth() <= dmgToCity.coerceAtLeast(1))
+                return 10000
+            if (attacker.unitHealth - battleDamage * 2 <= 0 && !attacker.hasUnique(UniqueType.SelfDestructs)) {
+                val friendlyUnitsAroundCity = city.getCenterTile().getExploredTilesInDistance(3)
+                    .count { it.militaryUnit?.civ() == attacker.civ() }
+                if (friendlyUnitsAroundCity < 5) {
+                    val attackerHealthModifier = 1.0 + 1.0 / friendlyUnitsAroundCity
+                    if (attacker.unitHealth - battleDamage * attackerHealthModifier <= 0)
+                        return 0 // We'll probably die next turn if we attack the city
+                }
+            }
+        } else if (isMelee) {
             val battleDamage = attackerUnit.calculateDamageToAttacker(cityUnit)
             if (attacker.unitHealth - battleDamage * 2 <= 0 && !attacker.hasUnique(UniqueType.SelfDestructs)) {
                 // The more fiendly units around the city, the more willing we should be to just attack the city

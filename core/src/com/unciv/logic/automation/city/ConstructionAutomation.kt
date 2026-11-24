@@ -259,19 +259,61 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
         addChoice(relativeCostEffectiveness, spaceshipPart, modifier)
     }
 
+    private var cachedTechRankIndex: Int = -1
+    private var cachedIsBorderCityNearForeignCapital: Boolean? = null
+
+    @Readonly @Suppress("purity")
+    private fun isBorderCityNearForeignCapital(): Boolean {
+        cachedIsBorderCityNearForeignCapital?.let { return it }
+        val res = civInfo.getKnownCivs()
+            .mapNotNull { NextTurnAutomation.getForeignCityNearCapital(it.getCapital(), civInfo) }
+            .any { it.city == city }
+        cachedIsBorderCityNearForeignCapital = res
+        return res
+    }
+
+    @Readonly @Suppress("purity")
+    private fun getTechRankIndex(): Int {
+        if (cachedTechRankIndex >= 0) return cachedTechRankIndex
+        val idx = civInfo.gameInfo.getAliveMajorCivs()
+            .sortedByDescending { it.getStatForRanking(RankingType.Technologies) }
+            .indexOf(civInfo)
+        cachedTechRankIndex = idx
+        return idx
+    }
+
     private fun addBuildingChoices() {
-        val cityBaseline = computeCityBaseline()
+        val totalEmpirePop = civInfo.cities.sumOf { it.population.population }
+        val allowWonders = !city.isPuppet && cityIsOverAverageProduction && totalEmpirePop >= 12
+        val candidates = ArrayList<Building>()
         for (building in buildings.filterBuildable()) {
-            if (building.isWonder && city.isPuppet) continue
-            // We shouldn't try to build wonders in undeveloped cities and empires
-            if (building.isWonder && (!cityIsOverAverageProduction || civInfo.cities.sumOf { it.population.population } < 12)) continue
-            addChoice(relativeCostEffectiveness, building, getValueOfBuilding(building, cityBaseline))
+            if (building.isWonder && !allowWonders) continue
+            candidates.add(building)
+        }
+        if (candidates.isEmpty()) return
+
+        // Clone the city ONCE instead of once per candidate building (~30x fewer City.clone() + setTransients() calls!)
+        val scratchCity = city.clone()
+        try {
+            scratchCity.setTransients(city.civ)
+            scratchCity.cityStats.update(updateCivStats = false, calculateGrowthModifiers = false)
+            val cityBaseline = scratchCity.cityStats.currentCityStats.clone()
+
+            for (building in candidates) {
+                addChoice(relativeCostEffectiveness, building, getValueOfBuilding(building, cityBaseline, scratchCity))
+            }
+        } finally {
+            city.expansion.setTransients() // Revert owned tiles to original city once at the end
         }
     }
 
-    private fun getValueOfBuilding(building: Building, cityBaseline: Stats): Float {
+    private fun getValueOfBuilding(
+        building: Building,
+        cityBaseline: Stats,
+        scratchCity: com.unciv.logic.city.City
+    ): Float {
         var value = 0f
-        value += applyBuildingStats(building, cityBaseline)
+        value += applyBuildingStats(building, cityBaseline, scratchCity)
         value += getMilitaryBuildingValue(building)
         value += getVictoryBuildingValue(building)
         value += getOnetimeUniqueBonuses(building)
@@ -283,7 +325,7 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
         var value = 0f
         if (building.isWonder) {
             // Buildings generally don't have these uniques, and Wonders generally only one of these, so we can save some time by not checking every building for every unique
-            if (!building.isNationalWonder) value -= civInfo.gameInfo.getAliveMajorCivs().sortedByDescending { it.getStatForRanking(RankingType.Technologies) }.indexOf(civInfo)
+            if (!building.isNationalWonder) value -= getTechRankIndex()
             // Wonders are a one-time occurence: value less if someone is going to build them before us anyways
             value += when {
                 building.hasUnique(UniqueType.OneTimeFreePolicy) || building.hasUnique(UniqueType.OneTimeAmountFreePolicies) -> civInfo.getPersonality().culture
@@ -323,9 +365,7 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
         var value = 0f
         var warModifier = if (isAtWar) 1f else .5f
         // If this city is the closest city to another civ, that makes it a likely candidate for attack
-        if (civInfo.getKnownCivs()
-                    .mapNotNull { NextTurnAutomation.getForeignCityNearCapital(it.getCapital(), civInfo) }
-                    .any { it.city == city })
+        if (isBorderCityNearForeignCapital())
             warModifier *= 2f
         value += warModifier * building.cityHealth.toFloat() / city.getMaxHealth() * personality.inverseModifierFocus(PersonalityValue.Aggressive, .3f)
         value += warModifier * building.cityStrength.toFloat() / (city.getStrength() + 3) * personality.inverseModifierFocus(PersonalityValue.Aggressive, .3f) // The + 3 here is to reduce the priority of building walls immedietly
@@ -342,8 +382,12 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
         return value
     }
 
-    private fun applyBuildingStats(building: Building, cityBaseline: Stats): Float {
-        val buildingStats = getStatDifferenceFromBuilding(building.name, cityBaseline)
+    private fun applyBuildingStats(
+        building: Building,
+        cityBaseline: Stats,
+        scratchCity: com.unciv.logic.city.City
+    ): Float {
+        val buildingStats = getStatDifferenceFromBuilding(building.name, cityBaseline, scratchCity)
         buildingStats.add(getBuildingStatsFromUniques(building, buildingStats))
 
         buildingStats.food *= 3
@@ -366,26 +410,17 @@ class ConstructionAutomation(val cityConstructions: CityConstructions) {
         return Automation.rankStatsValue(buildingStats.clone(), GameView(civInfo.gameInfo, civInfo).civView)
     }
 
-    // NOT readonly safe, since it alters the tile ownership of real tiles
-    private fun computeCityBaseline(): Stats {
-        val baselineCity = city.clone()
-        baselineCity.setTransients(city.civ) // Will break the owned tiles. Needs to be reverted before leaving this function
-        //todo: breaks city connection; trade route gold is currently not considered for markets etc.
-        baselineCity.cityStats.update(updateCivStats = false, calculateGrowthModifiers = false) // Don't consider growth penalties for food values (we can work more mines/specialists instead of farms)
-        val baseline = baselineCity.cityStats.currentCityStats
-        city.expansion.setTransients() // Revert owned tiles to original city
-        return baseline
-    }
-
-    // NOT readonly safe, since it alters the tile ownership of real tiles
-    private fun getStatDifferenceFromBuilding(building: String, cityBaseline: Stats): Stats {
-        val newCity = city.clone()
-        newCity.setTransients(city.civ) // Will break the owned tiles. Needs to be reverted before leaving this function
-        newCity.cityConstructions.builtBuildings.add(building)
-        newCity.cityConstructions.setTransients()
-        newCity.cityStats.update(updateCivStats = false, calculateGrowthModifiers = false)
-        city.expansion.setTransients() // Revert owned tiles to original city
-        return newCity.cityStats.currentCityStats - cityBaseline
+    private fun getStatDifferenceFromBuilding(
+        building: String,
+        cityBaseline: Stats,
+        scratchCity: com.unciv.logic.city.City
+    ): Stats {
+        scratchCity.cityConstructions.builtBuildings.add(building)
+        scratchCity.cityConstructions.setTransients()
+        scratchCity.cityStats.update(updateCivStats = false, calculateGrowthModifiers = false)
+        val diff = scratchCity.cityStats.currentCityStats - cityBaseline
+        scratchCity.cityConstructions.builtBuildings.remove(building)
+        return diff
     }
 
     @Readonly

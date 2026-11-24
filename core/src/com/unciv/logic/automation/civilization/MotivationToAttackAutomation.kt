@@ -34,9 +34,18 @@ object MotivationToAttackAutomation {
         val personality = civInfo.getPersonality()
 
         val civView = GameView(civInfo.gameInfo, civInfo).civView
-        val targetCitiesWithOurCity = ThreatManager.getNeighboringCitiesOfOtherCivs(civView).filter { it.second.owningCiv().getCiv() == targetCiv }
-            // Temporary - the logic below still works on City
-            .map { pair -> Pair(civInfo.cities.first { it.location == pair.first.location }, targetCiv.cities.first { it.location == pair.second.location }) }.toList()
+        // Direct pair check (civInfo.cities x targetCiv.cities) instead of scanning all 250+ world cities
+        @yairm210.purity.annotations.LocalState
+        val targetCitiesWithOurCity = ArrayList<Pair<City, City>>()
+        for (ourCity in civInfo.cities) {
+            val ourTile = ourCity.getCenterTile()
+            for (theirCity in targetCiv.cities) {
+                val theirTile = theirCity.getCenterTile()
+                if (theirTile.aerialDistanceTo(ourTile) <= 12 && theirTile.isExplored(civInfo)) {
+                    targetCitiesWithOurCity.add(Pair(ourCity, theirCity))
+                }
+            }
+        }
         val targetCities = targetCitiesWithOurCity.map { it.second }
 
         if (targetCitiesWithOurCity.isEmpty()) return 0f
@@ -61,8 +70,30 @@ object MotivationToAttackAutomation {
 
         modifiers.add(Pair("Their allies", getDefensivePactAlliesScore(targetCiv, civInfo, baseForce, ourCombatStrength)))
 
-        if (ThreatManager.getNeighboringCivilizations(civView).map { it.getCiv() }.none { it != targetCiv && it.isMajorCiv
-                        && civInfo.getDiplomacyManager(it)!!.isRelationshipLevelLT(RelationshipLevel.Friend) })
+        // Short-circuit check for any other hostile/non-friendly neighboring major civ without wrapping all world cities
+        var hasOtherNeighborThreat = false
+        for (otherCiv in civInfo.getKnownCivs()) {
+            if (otherCiv == targetCiv || !otherCiv.isMajorCiv || otherCiv.cities.isEmpty()) continue
+            val dm = civInfo.getDiplomacyManager(otherCiv) ?: continue
+            if (!dm.isRelationshipLevelLT(RelationshipLevel.Friend)) continue
+            var isNeighbor = false
+            for (ourCity in civInfo.cities) {
+                val ourTile = ourCity.getCenterTile()
+                for (otherCity in otherCiv.cities) {
+                    val otherTile = otherCity.getCenterTile()
+                    if (otherTile.aerialDistanceTo(ourTile) <= 12 && otherTile.isExplored(civInfo)) {
+                        isNeighbor = true
+                        break
+                    }
+                }
+                if (isNeighbor) break
+            }
+            if (isNeighbor) {
+                hasOtherNeighborThreat = true
+                break
+            }
+        }
+        if (!hasOtherNeighborThreat)
             modifiers.add(Pair("No other threats", 10f))
 
         if (targetCiv.isMajorCiv) {

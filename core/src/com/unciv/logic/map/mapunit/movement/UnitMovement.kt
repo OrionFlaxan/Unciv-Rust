@@ -691,6 +691,17 @@ class UnitMovement(val unit: MapUnit) {
             payload.removeFromTile()
         // Step 2: Perform the movement
         unit.movement.moveToTile(destination)
+        // If unit could not reach destination (e.g. fog-of-war revealed a blocker/ZoC mid-move), restore otherUnit and abort swap cleanly
+        if (unit.isDestroyed || unit.currentTile != theirOldPosition) {
+            otherUnit.putInTile(theirOldPosition)
+            for (payload in theirPayload) {
+                payload.putInTile(theirOldPosition)
+                payload.isTransported = true
+            }
+            clearPathfindingCache()
+            otherUnit.movement.clearPathfindingCache()
+            return
+        }
         // Step 3: Release the newly taken tile
         unit.removeFromTile()
         for (payload in ourPayload)
@@ -703,6 +714,17 @@ class UnitMovement(val unit: MapUnit) {
         }
         // Step 5: Perform the another movement
         otherUnit.movement.moveToTile(ourOldPosition)
+        // If otherUnit could not vacate theirOldPosition (e.g. Step 2 revealed a new enemy/ZoC), roll unit back to ourOldPosition cleanly
+        if (!otherUnit.isDestroyed && otherUnit.currentTile == theirOldPosition) {
+            unit.putInTile(ourOldPosition)
+            for (payload in ourPayload) {
+                payload.putInTile(ourOldPosition)
+                payload.isTransported = true
+            }
+            clearPathfindingCache()
+            otherUnit.movement.clearPathfindingCache()
+            return
+        }
         // Step 6: Restore the position in the new tile after step 3
         unit.putInTile(theirOldPosition)
         for (payload in ourPayload) {
@@ -713,6 +735,7 @@ class UnitMovement(val unit: MapUnit) {
         otherUnit.mostRecentMoveType = UnitMovementMemoryType.UnitMoved
         unit.mostRecentMoveType = UnitMovementMemoryType.UnitMoved
         clearPathfindingCache()
+        otherUnit.movement.clearPathfindingCache()
         unit.getOtherEscortUnit()?.movement?.clearPathfindingCache()
     }
 
@@ -1045,6 +1068,30 @@ class UnitMovement(val unit: MapUnit) {
             if (path.isNotEmpty()) return i to path
         }
         return -1 to emptyList()
+    }
+
+    /**
+     * Single-expansion reachability check for multiple [candidates] simultaneously.
+     * Replaces K separate `canReach(tile)` calls (e.g. inside `WorkerAutomation.findTileToWork`)
+     * with ONE shared Rust Dijkstra expansion, with transparent Kotlin fallback.
+     */
+    @Readonly @Suppress("purity")
+    fun batchCanReach(candidates: List<Tile>): BooleanArray {
+        val n = candidates.size
+        if (n == 0) return BooleanArray(0)
+        if (unit.cache.cannotMove) return BooleanArray(n) { candidates[it] == unit.currentTile }
+        if (n == 1) return booleanArrayOf(canReach(candidates[0]))
+        if (!unit.baseUnit.isAirUnit() && !unit.isPreparingParadrop()) {
+            val mirror = unit.getTile().tileMap.getOrCreateNativeWorld()
+            if (mirror != null && mirror.canUseNativePathing(unit, true)) {
+                val res = mirror.batchCanReach(unit, candidates)
+                for (i in 0 until n) {
+                    if (!res[i]) pathfindingCache.markUnreachable(candidates[i])
+                }
+                return res
+            }
+        }
+        return BooleanArray(n) { canReach(candidates[it]) }
     }
 
     /**

@@ -152,6 +152,31 @@ class CivView(civ: Civilization,
         return out
     }
 
+    @Readonly
+    fun getDangerousTilesInRadiusNative(centerTile: TileView, radius: Int): List<TileView>? {
+        val mirror = civ.gameInfo.tileMap.getOrCreateNativeWorld() ?: return null
+        val tiles = mirror.getDangerousTilesInRadius(civ, centerTile.unwrap(), radius)
+        if (tiles.isEmpty()) return emptyList()
+        val tmv = gameView.tileMapView
+        val out = ArrayList<TileView>(tiles.size)
+        for (t in tiles) out.add(tmv.getTile(t))
+        return out
+    }
+
+    @Readonly
+    fun queryFlowNextStepNative(fieldKind: Int, fromTile: TileView): TileView? {
+        val mirror = civ.gameInfo.tileMap.nativeWorld ?: return null
+        val next = mirror.queryFlowNextStep(civ, fieldKind, fromTile.unwrap()) ?: return null
+        return gameView.tileMapView.getTile(next)
+    }
+
+    @Readonly
+    fun queryFlowDistNative(fieldKind: Int, fromTile: TileView): Int? {
+        val mirror = civ.gameInfo.tileMap.nativeWorld ?: return null
+        if (!mirror.hasFreshFlowFieldsFor(civ)) return null
+        return mirror.queryFlowDist(civ, fieldKind, fromTile.unwrap())
+    }
+
     fun tryDismissPolicyPicker(): Boolean { civ.policies.shouldOpenPolicyPicker = false; return true }
     fun tryDismissMoveSpies(): Boolean { civ.espionageManager.dismissedShouldMoveSpies = true; return true }
     fun tryMarkMovedAutomatedUnits(): Boolean { civ.hasMovedAutomatedUnits = true; return true }

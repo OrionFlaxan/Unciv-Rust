@@ -3,6 +3,7 @@ package com.unciv.nativeengine
 import com.unciv.Constants
 import com.unciv.UncivGame
 import com.unciv.logic.GameInfo
+import com.unciv.logic.battle.CityCombatant
 import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
 import com.unciv.logic.civilization.diplomacy.DiplomaticStatus
@@ -24,6 +25,7 @@ import com.unciv.utils.DebugUtils
 import yairm210.purity.annotations.Readonly
 import java.lang.ref.PhantomReference
 import java.lang.ref.ReferenceQueue
+import java.util.Arrays
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -53,6 +55,20 @@ class NativeWorldMirror private constructor(
     private var syncedCivs: List<Civilization> = emptyList()
     @Volatile private var threatCivIdx: Int = -1
     @Volatile var threatDirty: Boolean = true
+    @Volatile private var flowFieldsCivIdx: Int = -1
+    @Volatile var flowFieldsDirty: Boolean = true
+    @Volatile private var tileDefDirty: Boolean = true
+    @Volatile private var validRoadBitsCivIdx: Int = -1
+    @Volatile private var validRoadBitsDirty: Boolean = true
+    private var cachedValidRoadBits: LongArray? = null
+
+    // Lazily allocated reusable buffers for O(U + C) Turbo AI combat snapshots (zero per-turn GC)
+    private var bufMilHp: ByteArray? = null
+    private var bufMilStr: ShortArray? = null
+    private var bufCityHp: ShortArray? = null
+    private var bufCityMaxHp: ShortArray? = null
+    private var bufCityStr: ShortArray? = null
+    private var bufTileDefPct: ShortArray? = null
 
     // Cached per-civ scalars to catch direct field mutations (e.g. in tests or mods) in O(1)
     private var cachedCivFlags = IntArray(0)
@@ -280,6 +296,9 @@ class NativeWorldMirror private constructor(
         dynamicDirty = false
         diploDirty = false
         threatDirty = true
+        flowFieldsDirty = true
+        tileDefDirty = true
+        validRoadBitsDirty = true
     }
 
     private fun syncDiploAndCivs(gameInfo: GameInfo) {
@@ -313,6 +332,8 @@ class NativeWorldMirror private constructor(
         enemyPenaltyCivs = penaltyCivs
         diploDirty = false
         threatDirty = true
+        flowFieldsDirty = true
+        validRoadBitsDirty = true
     }
 
     /** O(1) scalar check catching direct mutations on `civ.tech` / `civ.passableImpassables` (e.g. in tests). */
@@ -372,6 +393,11 @@ class NativeWorldMirror private constructor(
         val br = if (tile.isCityCenter()) tile.getCity()!!.getBombardRange().coerceIn(0, 127).toByte() else 0
         UncivRustNative.nativePatchTileDynamic(h, idx, owner, flags, br)
         threatDirty = true
+        flowFieldsDirty = true
+        validRoadBitsDirty = true
+        bufTileDefPct?.let { arr ->
+            if (idx < arr.size) arr[idx] = (tile.getDefensiveBonus() * 100f).toInt().coerceIn(-500, 500).toShort()
+        }
     }
 
     fun onTileTerrainChanged(tile: Tile) {
@@ -393,6 +419,11 @@ class NativeWorldMirror private constructor(
             terrainIdByte(tile.lastTerrain.name),
             computeFeatureMask(tile)
         )
+        flowFieldsDirty = true
+        validRoadBitsDirty = true
+        bufTileDefPct?.let { arr ->
+            if (idx < arr.size) arr[idx] = (tile.getDefensiveBonus() * 100f).toInt().coerceIn(-500, 500).toShort()
+        }
     }
 
     fun onTileExploredChanged(civ: Civilization, tile: Tile, explored: Boolean) {
@@ -400,6 +431,7 @@ class NativeWorldMirror private constructor(
         val cIdx = civ.civIndex
         if (h == 0L || dynamicDirty || cIdx < 0 || cIdx >= syncedNumCivs) return
         UncivRustNative.nativePatchTileExplored(h, cIdx, tile.zeroBasedIndex, explored)
+        if (cIdx == validRoadBitsCivIdx) validRoadBitsDirty = true
     }
 
     fun onDiplomacyChanged(civA: Civilization, civB: Civilization) {
@@ -414,6 +446,8 @@ class NativeWorldMirror private constructor(
         UncivRustNative.nativePatchDiplo(h, a, b, computeDiploByte(civA, civB))
         UncivRustNative.nativePatchDiplo(h, b, a, computeDiploByte(civB, civA))
         threatDirty = true
+        flowFieldsDirty = true
+        validRoadBitsDirty = true
     }
 
     fun markVisionDirty(civ: Civilization? = null) {
@@ -857,24 +891,32 @@ class NativeWorldMirror private constructor(
         var ti = 0
         for (t in targets) targetArr[ti++] = t.zeroBasedIndex
 
-        // Build validRoadBits using fast explored-bitset filter (skips unexplored & water immediately)
         val tiles = tileMap.tileList
-        val validBits = LongArray(bitsetWords)
-        val exploredBits = civ.exploredTileBits
-        val hasExploredBits = exploredBits.size >= bitsetWords
-        val spectator = DebugUtils.VISIBLE_MAP || civ.isSpectator
-        for (i in 0 until numTiles) {
-            if (!spectator && hasExploredBits && ((exploredBits[i ushr 6] ushr (i and 63)) and 1L) == 0L) {
-                continue
+        val cIdx = civ.civIndex
+        val validBits = if (!validRoadBitsDirty && validRoadBitsCivIdx == cIdx && cachedValidRoadBits != null) {
+            cachedValidRoadBits!!
+        } else {
+            // Build validRoadBits using fast explored-bitset filter (skips unexplored & water immediately)
+            val bits = cachedValidRoadBits?.also { Arrays.fill(it, 0L) } ?: LongArray(bitsetWords).also { cachedValidRoadBits = it }
+            val exploredBits = civ.exploredTileBits
+            val hasExploredBits = exploredBits.size >= bitsetWords
+            val spectator = DebugUtils.VISIBLE_MAP || civ.isSpectator
+            for (i in 0 until numTiles) {
+                if (!spectator && hasExploredBits && ((exploredBits[i ushr 6] ushr (i and 63)) and 1L) == 0L) {
+                    continue
+                }
+                val tile = tiles[i]
+                if (tile.isWater || tile.isImpassible()) continue
+                if (MapPathing.isValidRoadPathTile(civ, tile)) {
+                    bits[i ushr 6] = bits[i ushr 6] or (1L shl (i and 63))
+                }
             }
-            val tile = tiles[i]
-            if (tile.isWater || tile.isImpassible()) continue
-            if (MapPathing.isValidRoadPathTile(civ, tile)) {
-                validBits[i ushr 6] = validBits[i ushr 6] or (1L shl (i and 63))
-            }
+            validRoadBitsCivIdx = cIdx
+            validRoadBitsDirty = false
+            bits
         }
         val pathIdx = UncivRustNative.nativeFindRoadPath(
-            handle, civ.civIndex, startTile.zeroBasedIndex, targetArr, validBits, maxHalfCost
+            handle, cIdx, startTile.zeroBasedIndex, targetArr, validBits, maxHalfCost
         )
         if (pathIdx.isEmpty()) return null
         val out = ArrayList<Tile>(pathIdx.size)
@@ -898,6 +940,341 @@ class NativeWorldMirror private constructor(
         return UncivRustNative.nativeEvalAttackPaths(
             handle, civ.civIndex, targetCiv.civIndex,
             ourTiles, enemyTiles, capitalTile.zeroBasedIndex, allEnemies
+        )
+    }
+
+    // =========================================================================
+    // 5. v0.2.0 — Fast Topology Clone, O(V) Flow-Fields, Batch Reach & Turbo AI
+    // =========================================================================
+
+    /**
+     * Clones this mirror's static terrain/neighbor/river/continent topology via Rust `memcpy`
+     * (~0.05 ms on a Huge map) into a brand-new [NativeWorldMirror] bound to [newTileMap].
+     * Dynamic state remains marked dirty until first query on [newTileMap].
+     */
+    @Readonly @Suppress("purity")
+    fun cloneTopologyFor(newTileMap: TileMap): NativeWorldMirror? {
+        if (!NativeEngine.isAvailable) return null
+        ensureTopologySynced()
+        val srcH = handle
+        if (srcH == 0L || newTileMap.tileList.size != numTiles) return null
+        drainDeadHandles()
+        val clonedH = UncivRustNative.nativeCloneWorldTopology(srcH)
+        if (clonedH == 0L) return null
+        val hRef = AtomicLong(clonedH)
+        val mirror = NativeWorldMirror(
+            tileMap = newTileMap,
+            handleRef = hRef,
+            numTiles = numTiles,
+            bitsetWords = bitsetWords,
+            terrainIdMap = terrainIdMap
+        )
+        mirror.topologyDirty = false
+        mirror.dynamicDirty = true
+        mirror.diploDirty = true
+        mirror.threatDirty = true
+        mirror.flowFieldsDirty = true
+        mirror.tileDefDirty = true
+        val phantom = PhantomReference(mirror, refQueue)
+        liveHandles[phantom] = hRef
+        return mirror
+    }
+
+    /**
+     * Syncs live military unit HP/strength, city HP/strength, and tile defensive bonuses into Rust
+     * for enemies currently at war with [civ] in O(U_enemy + C_enemy) using reused primitive buffers.
+     */
+    fun syncCombatSnapshot(civ: Civilization, gameInfo: GameInfo) {
+        val h = handle
+        if (h == 0L) return
+        val n = numTiles
+        val tiles = tileMap.tileList
+        if (tiles.size != n) return
+
+        val milHp = bufMilHp ?: ByteArray(n).also { bufMilHp = it }
+        val milStr = bufMilStr ?: ShortArray(n).also { bufMilStr = it }
+        val cityHp = bufCityHp ?: ShortArray(n).also { bufCityHp = it }
+        val cityMaxHp = bufCityMaxHp ?: ShortArray(n).also { bufCityMaxHp = it }
+        val cityStr = bufCityStr ?: ShortArray(n).also { bufCityStr = it }
+        val tileDef = bufTileDefPct ?: ShortArray(n).also { bufTileDefPct = it; tileDefDirty = true }
+
+        val firstTileDefSync = tileDefDirty
+        if (tileDefDirty) {
+            for (i in 0 until n) {
+                tileDef[i] = (tiles[i].getDefensiveBonus() * 100f).toInt().coerceIn(-500, 500).toShort()
+            }
+            tileDefDirty = false
+        }
+
+        // Only warring enemies (including Barbarians!) are ever evaluated as combat targets by turbo_ai.rs
+        var anyEnemy = false
+        val civs = gameInfo.civilizations
+        for (ci in 0 until civs.size) {
+            val other = civs[ci]
+            if (other !== civ && other.isAlive() && civ.isAtWarWith(other)) {
+                anyEnemy = true
+                break
+            }
+        }
+        if (!anyEnemy && !firstTileDefSync) return
+
+        Arrays.fill(milHp, 0)
+        Arrays.fill(milStr, 0)
+        Arrays.fill(cityHp, 0)
+        Arrays.fill(cityMaxHp, 0)
+        Arrays.fill(cityStr, 0)
+
+        if (anyEnemy) {
+            for (ci in 0 until civs.size) {
+                val c = civs[ci]
+                if (c === civ || !c.isAlive() || !civ.isAtWarWith(c)) continue
+                val units = c.units.getCivUnits()
+                for (u in units) {
+                    if (u.isCivilian() || u.baseUnit.isAirUnit() || !u.hasTile()) continue
+                    val idx = u.currentTile.zeroBasedIndex
+                    if (idx in 0 until n) {
+                        milHp[idx] = u.health.coerceIn(0, 100).toByte()
+                        milStr[idx] = u.baseUnit.strength.coerceIn(0, 30000).toShort()
+                    }
+                }
+                val cities = c.cities
+                for (k in 0 until cities.size) {
+                    val city = cities[k]
+                    val idx = city.getCenterTile().zeroBasedIndex
+                    if (idx in 0 until n) {
+                        cityHp[idx] = city.health.coerceIn(0, 30000).toShort()
+                        cityMaxHp[idx] = city.getMaxHealth().coerceIn(1, 30000).toShort()
+                        cityStr[idx] = CityCombatant(city).getDefendingStrength().coerceIn(1, 30000).toShort()
+                    }
+                }
+            }
+        }
+
+        UncivRustNative.nativeSyncCombatSnapshot(h, milHp, milStr, cityHp, cityMaxHp, cityStr, tileDef)
+    }
+
+    /** O(1) incremental combat scalar patch for [tile] after a move or battle. */
+    fun patchTileCombat(tile: Tile) {
+        val h = handle
+        if (h == 0L || dynamicDirty) return
+        val idx = tile.zeroBasedIndex
+        if (idx < 0 || idx >= numTiles) return
+        val mu = tile.militaryUnit
+        val milHp = (mu?.health?.coerceIn(0, 100) ?: 0).toByte()
+        val milStr = (mu?.baseUnit?.strength?.coerceIn(0, 30000) ?: 0).toShort()
+        val city = tile.getCity()
+        val isCenter = city != null && tile.isCityCenter()
+        val cHp = (if (isCenter) city.health.coerceIn(0, 30000) else 0).toShort()
+        val cMaxHp = (if (isCenter) city.getMaxHealth().coerceIn(1, 30000) else 0).toShort()
+        val cStr = (if (isCenter) CityCombatant(city).getDefendingStrength().coerceIn(1, 30000) else 0).toShort()
+        val defPct = (tile.getDefensiveBonus() * 100f).toInt().coerceIn(-500, 500).toShort()
+        UncivRustNative.nativePatchTileCombat(h, idx, milHp, milStr, cHp, cMaxHp, cStr, defPct)
+    }
+
+    /**
+     * Precomputes all 5 O(V) Theater Flow-Fields for [civ] in parallel via Rust's bounded Rayon pool.
+     */
+    fun precomputeCivFlowFields(
+        civ: Civilization,
+        enemyCityTiles: List<Tile>,
+        siegedCityTiles: List<Tile>,
+        ownCityTiles: List<Tile>
+    ) {
+        val h = handle
+        if (h == 0L) return
+        ensureThreatField(civ)
+        ensureCivFlagsCurrent(civ)
+        val enemyArr = if (enemyCityTiles.isEmpty()) EMPTY_INT_ARRAY else IntArray(enemyCityTiles.size) { enemyCityTiles[it].zeroBasedIndex }
+        val siegedArr = if (siegedCityTiles.isEmpty()) EMPTY_INT_ARRAY else IntArray(siegedCityTiles.size) { siegedCityTiles[it].zeroBasedIndex }
+        val ownArr = if (ownCityTiles.isEmpty()) EMPTY_INT_ARRAY else IntArray(ownCityTiles.size) { ownCityTiles[it].zeroBasedIndex }
+        UncivRustNative.nativePrecomputeCivFlowFields(h, civ.civIndex, enemyArr, siegedArr, ownArr)
+        flowFieldsCivIdx = civ.civIndex
+        flowFieldsDirty = false
+    }
+
+    @Readonly
+    fun hasFreshFlowFieldsFor(civ: Civilization): Boolean =
+        handle != 0L && !flowFieldsDirty && flowFieldsCivIdx == civ.civIndex
+
+    @Readonly @Suppress("purity")
+    fun queryFlowNextStep(civ: Civilization, fieldKind: Int, fromTile: Tile): Tile? {
+        if (!hasFreshFlowFieldsFor(civ)) return null
+        val nxt = UncivRustNative.nativeQueryFlowNextStep(handle, fieldKind, fromTile.zeroBasedIndex)
+        if (nxt < 0 || nxt >= numTiles) return null
+        return tileMap.tileList[nxt]
+    }
+
+    @Readonly @Suppress("purity")
+    fun queryFlowDist(civ: Civilization, fieldKind: Int, fromTile: Tile): Int {
+        if (!hasFreshFlowFieldsFor(civ)) return UncivRustNative.FLOW_UNREACHED
+        return UncivRustNative.nativeQueryFlowDist(handle, fieldKind, fromTile.zeroBasedIndex)
+    }
+
+    @Readonly @Suppress("purity")
+    fun getDangerousTilesInRadius(civ: Civilization, centerTile: Tile, radius: Int): List<Tile> {
+        ensureThreatField(civ)
+        val indices = UncivRustNative.nativeGetDangerousTilesInRadius(
+            handle, civ.civIndex, centerTile.zeroBasedIndex, radius
+        )
+        if (indices.isEmpty()) return emptyList()
+        val tileList = tileMap.tileList
+        val out = ArrayList<Tile>(indices.size)
+        for (idx in indices) out.add(tileList[idx])
+        return out
+    }
+
+    @Readonly @Suppress("purity")
+    fun hasEnoughSettlerRoom(gameInfo: GameInfo, cityTiles: List<Tile>, minCount: Int): Boolean {
+        if (cityTiles.isEmpty()) return false
+        ensureSynced(gameInfo)
+        val arr = IntArray(cityTiles.size) { cityTiles[it].zeroBasedIndex }
+        return UncivRustNative.nativeHasEnoughSettlerRoom(handle, arr, minCount)
+    }
+
+    /**
+     * Single-expansion reachability check for multiple [candidates] simultaneously (replaces K
+     * separate `canReach(tile)` calls inside `WorkerAutomation.findTileToWork`).
+     */
+    @Readonly @Suppress("purity")
+    fun batchCanReach(
+        unit: MapUnit,
+        candidates: List<Tile>,
+        avoidDamagingTerrain: Boolean = false,
+        maxTurns: Int = 62
+    ): BooleanArray {
+        val count = candidates.size
+        if (count == 0) return BooleanArray(0)
+        val gameInfo = unit.civ.gameInfo
+        ensureSynced(gameInfo)
+        ensureCivFlagsCurrent(unit.civ)
+
+        val useAStar = UncivGame.Current.settings.useAStarPathfinding
+        val flags = encodeProfileFlags(unit, true, avoidDamagingTerrain, useAStar)
+        val (dmFeat, dmBase, dmHill) = encodeDoubleMovementMasks(unit)
+        val curMove = unit.currentMovement
+        val curFpm = FixedPointMovement.fpmFromMovement(curMove).bits
+        val fullFpm = FixedPointMovement.fpmFromMovement(unit.getMaxMovement()).bits
+        val embFpm = unit.cache.costToEmbark?.let { FixedPointMovement.fpmFromMovement(it).bits } ?: -1
+        val disFpm = unit.cache.costToDisembark?.let { FixedPointMovement.fpmFromMovement(it).bits } ?: -1
+        val penFpm = resolveEnemyPenaltyFpm(unit)
+
+        val candIdx = IntArray(count) { candidates[it].zeroBasedIndex }
+        val raw = UncivRustNative.nativeBatchCanReach(
+            handle, unit.civ.civIndex, unit.currentTile.zeroBasedIndex, flags,
+            curMove, curFpm, fullFpm,
+            embFpm, disFpm, penFpm,
+            dmFeat, dmBase, dmHill,
+            candIdx, maxTurns
+        )
+        val out = BooleanArray(count)
+        val lim = minOf(count, raw.size)
+        for (i in 0 until lim) out[i] = raw[i].toInt() != 0
+        return out
+    }
+
+    /**
+     * Conservative mod-safe eligibility filter for **Turbo Rust Native AI** parallel planning.
+     * Any civilian, air, nuke, settler, worker, great person, religious, self-destruct, or
+     * exotic modded unit returns `false` and runs standard Kotlin `UnitAutomation`.
+     */
+    @Readonly @Suppress("purity")
+    fun isUnitEligibleForTurboAi(unit: MapUnit): Boolean {
+        if (!canUseNativePathing(unit, includeEscortUnit = true)) return false
+        if (unit.isDestroyed || !unit.hasTile() || !unit.hasMovement()) return false
+        if (unit.isCivilian() || unit.baseUnit.isAirUnit() || unit.isNuclearWeapon()) return false
+        if (unit.baseUnit.isGreatPerson) return false
+        if (unit.attacksThisTurn >= unit.maxAttacksPerTurn()) return false
+        if (unit.getDamageFromTerrain() > 0) return false
+        if (unit.hasUnique(UniqueType.CannotAttack)
+            || unit.hasUnique(UniqueType.SelfDestructs)
+            || unit.hasUnique(UniqueType.FoundCity)
+            || unit.hasUnique(UniqueType.FoundPuppetCity)
+            || unit.hasUnique(UniqueType.BuildImprovements)
+            || unit.hasUnique(UniqueType.CreateWaterImprovements)
+            || unit.hasUnique(UniqueType.ReligiousUnit)
+            || unit.hasUnique(UniqueType.CanOnlyAttackTiles)
+        ) return false
+        return true
+    }
+
+    /**
+     * Multi-threaded 2-phase Rayon batch combat & movement planner for **Turbo Rust Native AI**.
+     * Returns packed `IntArray` of length `units.size * 3`: `[actionCode, moveTileIdx, attackTileIdx]`.
+     */
+    fun planCivCombatUnits(civ: Civilization, units: List<MapUnit>): IntArray {
+        val count = units.size
+        if (count == 0 || handle == 0L) return EMPTY_INT_ARRAY
+        ensureThreatField(civ)
+        ensureCivFlagsCurrent(civ)
+        syncCombatSnapshot(civ, civ.gameInfo)
+
+        val useAStar = UncivGame.Current.settings.useAStarPathfinding
+        val isCs = civ.isCityState
+        val startTiles = IntArray(count)
+        val hps = IntArray(count)
+        val attackStrs = FloatArray(count)
+        val rangedStrs = FloatArray(count)
+        val ranges = IntArray(count)
+        val combatFlags = IntArray(count)
+        val profileFlags = IntArray(count)
+        val curMoveF32s = FloatArray(count)
+        val curMoveFpms = IntArray(count)
+        val fullMoveFpms = IntArray(count)
+        val embarkFpms = IntArray(count)
+        val disembarkFpms = IntArray(count)
+        val enemyPenaltyFpms = IntArray(count)
+        val dmFeatMasks = LongArray(count)
+        val dmBaseMasks = LongArray(count)
+        val dmHillMasks = LongArray(count)
+
+        for (i in 0 until count) {
+            val u = units[i]
+            val bu = u.baseUnit
+            startTiles[i] = u.currentTile.zeroBasedIndex
+            hps[i] = u.health
+            attackStrs[i] = bu.strength.toFloat()
+            rangedStrs[i] = bu.rangedStrength.toFloat()
+            ranges[i] = u.getRange()
+
+            var cf = 0
+            if (bu.isMelee()) cf = cf or UncivRustNative.TCF_IS_MELEE
+            if (bu.isRanged()) cf = cf or UncivRustNative.TCF_IS_RANGED
+            if (bu.isProbablySiegeUnit()) cf = cf or UncivRustNative.TCF_IS_SIEGE
+            if (u.hasUnique(UniqueType.IndirectFire)) cf = cf or UncivRustNative.TCF_INDIRECT_FIRE
+            if (u.hasUnique(UniqueType.NoDamagePenaltyWoundedUnits, checkCivInfoUniques = true)) {
+                cf = cf or UncivRustNative.TCF_NO_WOUNDED_PENALTY
+            }
+            if (u.hasUnique(UniqueType.CanMoveAfterAttacking)) cf = cf or UncivRustNative.TCF_CAN_MOVE_AFTER_ATTACK
+            if (u.hasUnique(UniqueType.CannotCaptureCities)) cf = cf or UncivRustNative.TCF_CANNOT_CAPTURE_CITIES
+            if (u.hasUnique(UniqueType.AttackAcrossRiver)) cf = cf or UncivRustNative.TCF_ATTACK_ACROSS_RIVER
+            if (u.hasUnique(UniqueType.AttackAcrossCoast)) cf = cf or UncivRustNative.TCF_ATTACK_ACROSS_COAST
+            if (u.hasUnique(UniqueType.MustSetUp)) cf = cf or UncivRustNative.TCF_MUST_SETUP
+            if (u.isSetUpForSiege()) cf = cf or UncivRustNative.TCF_IS_SETUP
+            if (u.canFortify()) cf = cf or UncivRustNative.TCF_CAN_FORTIFY
+            if (u.isEmbarked()) cf = cf or UncivRustNative.TCF_IS_EMBARKED
+            if (isCs) cf = cf or UncivRustNative.TCF_IS_CITY_STATE
+            combatFlags[i] = cf
+
+            profileFlags[i] = encodeProfileFlags(u, true, true, useAStar)
+            val curMove = u.currentMovement
+            curMoveF32s[i] = curMove
+            curMoveFpms[i] = FixedPointMovement.fpmFromMovement(curMove).bits
+            fullMoveFpms[i] = FixedPointMovement.fpmFromMovement(u.getMaxMovement()).bits
+            embarkFpms[i] = u.cache.costToEmbark?.let { FixedPointMovement.fpmFromMovement(it).bits } ?: -1
+            disembarkFpms[i] = u.cache.costToDisembark?.let { FixedPointMovement.fpmFromMovement(it).bits } ?: -1
+            enemyPenaltyFpms[i] = resolveEnemyPenaltyFpm(u)
+            val (fMask, bMask, hMask) = encodeDoubleMovementMasks(u)
+            dmFeatMasks[i] = fMask
+            dmBaseMasks[i] = bMask
+            dmHillMasks[i] = hMask
+        }
+
+        return UncivRustNative.nativePlanCivCombatUnits(
+            handle, civ.civIndex,
+            startTiles, hps, attackStrs, rangedStrs, ranges, combatFlags,
+            profileFlags, curMoveF32s, curMoveFpms, fullMoveFpms,
+            embarkFpms, disembarkFpms, enemyPenaltyFpms,
+            dmFeatMasks, dmBaseMasks, dmHillMasks
         )
     }
 

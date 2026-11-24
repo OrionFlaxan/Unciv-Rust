@@ -63,6 +63,74 @@ pub const CF_SPECTATOR_VISION: u32 = 1 << 10;
 pub const NO_TERRAIN_ID: u8 = 255;
 pub const NO_CIV: i16 = -1;
 pub const THREAT_UNREACHED: u8 = 255;
+pub const FLOW_UNREACHED: u16 = u16::MAX;
+
+/// Flow-field IDs for O(1) theater direction queries.
+pub const FLOW_ENEMY_CITY_LAND: i32 = 0;
+pub const FLOW_ENEMY_CITY_WATER: i32 = 1;
+pub const FLOW_FRIENDLY_CITY: i32 = 2;
+pub const FLOW_SIEGED_CITY: i32 = 3;
+pub const FLOW_EXPLORE_FRONTIER: i32 = 4;
+
+/// Execute `f` inside a lazily initialized bounded Rayon thread pool (capped at 4 worker threads
+/// so mobile Android devices achieve multi-core AI speedup without starving the GL/UI thread).
+pub fn with_rayon_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let threads = cores.clamp(1, 4);
+        if threads <= 1 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("unciv-rust-{i}"))
+            .build()
+            .ok()
+    });
+    match pool {
+        Some(p) => p.install(f),
+        None => f(),
+    }
+}
+
+/// Precomputed O(V) reverse-Dijkstra theater flow-fields for the active AI civ.
+pub struct FlowFieldCache {
+    pub civ: i32,
+    pub dirty: bool,
+    pub enemy_city_land_dist: Vec<u16>,
+    pub enemy_city_land_next: Vec<i32>,
+    pub enemy_city_water_dist: Vec<u16>,
+    pub enemy_city_water_next: Vec<i32>,
+    pub friendly_city_dist: Vec<u16>,
+    pub friendly_city_next: Vec<i32>,
+    pub sieged_city_dist: Vec<u16>,
+    pub sieged_city_next: Vec<i32>,
+    pub explore_frontier_dist: Vec<u16>,
+    pub explore_frontier_next: Vec<i32>,
+}
+
+impl FlowFieldCache {
+    pub fn new(num_tiles: usize) -> Self {
+        Self {
+            civ: -1,
+            dirty: true,
+            enemy_city_land_dist: vec![FLOW_UNREACHED; num_tiles],
+            enemy_city_land_next: vec![-1; num_tiles],
+            enemy_city_water_dist: vec![FLOW_UNREACHED; num_tiles],
+            enemy_city_water_next: vec![-1; num_tiles],
+            friendly_city_dist: vec![FLOW_UNREACHED; num_tiles],
+            friendly_city_next: vec![-1; num_tiles],
+            sieged_city_dist: vec![FLOW_UNREACHED; num_tiles],
+            sieged_city_next: vec![-1; num_tiles],
+            explore_frontier_dist: vec![FLOW_UNREACHED; num_tiles],
+            explore_frontier_next: vec![-1; num_tiles],
+        }
+    }
+}
 
 /// Stateful native world mirror owned by a `TileMap`'s `NativeWorldMirror`.
 pub struct NativeWorld {
@@ -102,6 +170,14 @@ pub struct NativeWorld {
     pub air_unit_civ: Vec<i16>,
     pub city_bombard_range: Vec<u8>,
 
+    // Per-tile combat scalars for zero-JVM-callback Rust combat evaluation
+    pub mil_unit_hp: Vec<u8>,
+    pub mil_unit_strength: Vec<u16>,
+    pub tile_def_bonus_pct: Vec<i16>,
+    pub city_hp: Vec<u16>,
+    pub city_max_hp: Vec<u16>,
+    pub city_strength: Vec<u16>,
+
     // Per-civ bitsets & vision refcounts
     pub explored_bits: Vec<u64>,
     pub visible_bits: Vec<u64>,
@@ -128,6 +204,9 @@ pub struct NativeWorld {
     pub threat_dist: Vec<u8>,
     pub threat_enemy_tiles: Vec<i32>,
     pub threat_danger_bits: Vec<u64>,
+
+    // Active-civ O(V) Theater Flow-Fields
+    pub flow_fields: FlowFieldCache,
 }
 
 impl NativeWorld {
@@ -169,6 +248,13 @@ impl NativeWorld {
             air_unit_civ: vec![NO_CIV; num_tiles],
             city_bombard_range: vec![0; num_tiles],
 
+            mil_unit_hp: vec![0; num_tiles],
+            mil_unit_strength: vec![0; num_tiles],
+            tile_def_bonus_pct: vec![0; num_tiles],
+            city_hp: vec![0; num_tiles],
+            city_max_hp: vec![0; num_tiles],
+            city_strength: vec![0; num_tiles],
+
             explored_bits: vec![0; num_civs * bitset_words],
             visible_bits: vec![0; num_civs * bitset_words],
             vision_refcount: vec![0; num_civs * num_tiles],
@@ -191,7 +277,38 @@ impl NativeWorld {
             threat_dist: vec![THREAT_UNREACHED; num_tiles],
             threat_enemy_tiles: Vec::new(),
             threat_danger_bits: vec![0; bitset_words],
+
+            flow_fields: FlowFieldCache::new(num_tiles),
         }
+    }
+
+    /// Ultra-fast pure-Rust `memcpy` clone of all static topology arrays (pos, neighbors, rivers,
+    /// terrain flags, elevation, continents, terrain IDs) so `WorldScreen.nextTurn()`'s cloned
+    /// `GameInfo` skips re-marshaling 5,000+ Kotlin `Tile` objects across JNI!
+    pub fn clone_static_topology(&self) -> Self {
+        let mut cloned = Self::new(
+            self.num_tiles,
+            self.num_civs,
+            self.world_wrap,
+            self.wrap_radius,
+            self.map_width,
+        );
+        cloned.pos_x.clone_from(&self.pos_x);
+        cloned.pos_y.clone_from(&self.pos_y);
+        cloned.neighbors.clone_from(&self.neighbors);
+        cloned.river_mask.clone_from(&self.river_mask);
+        cloned.terrain_flags.clone_from(&self.terrain_flags);
+        cloned.base_move_cost.clone_from(&self.base_move_cost);
+        cloned.terrain_damage.clone_from(&self.terrain_damage);
+        cloned.tile_height.clone_from(&self.tile_height);
+        cloned.unit_height.clone_from(&self.unit_height);
+        cloned.continent.clone_from(&self.continent);
+        cloned.base_terrain_id.clone_from(&self.base_terrain_id);
+        cloned.hill_terrain_id.clone_from(&self.hill_terrain_id);
+        cloned.last_terrain_id.clone_from(&self.last_terrain_id);
+        cloned.feature_terrain_mask.clone_from(&self.feature_terrain_mask);
+        cloned.tile_def_bonus_pct.clone_from(&self.tile_def_bonus_pct);
+        cloned
     }
 
     pub fn resize_civs(&mut self, num_civs: usize) {
@@ -210,6 +327,7 @@ impl NativeWorld {
         self.civ_passable_impassable_mask.resize(num_civs, 0);
         self.zoc_dirty = true;
         self.threat_dirty = true;
+        self.flow_fields.dirty = true;
     }
 
     #[inline(always)]
@@ -481,10 +599,34 @@ impl NativeWorld {
         if prev_city != new_city || (new_city && self.owner_civ[tile] != owner) {
             self.zoc_dirty = true;
             self.threat_dirty = true;
+            self.flow_fields.dirty = true;
         }
         self.owner_civ[tile] = owner;
         self.tile_flags[tile] = flags;
         self.city_bombard_range[tile] = bombard_range;
+    }
+
+    /// Incremental patch for combat scalars (unit HP/strength, city HP/strength, tile defense bonus).
+    #[inline]
+    pub fn patch_tile_combat(
+        &mut self,
+        tile: usize,
+        mil_hp: u8,
+        mil_str: u16,
+        city_hp: u16,
+        city_max_hp: u16,
+        city_str: u16,
+        def_bonus_pct: i16,
+    ) {
+        if tile >= self.num_tiles {
+            return;
+        }
+        self.mil_unit_hp[tile] = mil_hp;
+        self.mil_unit_strength[tile] = mil_str;
+        self.city_hp[tile] = city_hp;
+        self.city_max_hp[tile] = city_max_hp;
+        self.city_strength[tile] = city_str;
+        self.tile_def_bonus_pct[tile] = def_bonus_pct;
     }
 
     /// Incremental patch when a tile's terrain changes (forest chop, fallout, etc.).
